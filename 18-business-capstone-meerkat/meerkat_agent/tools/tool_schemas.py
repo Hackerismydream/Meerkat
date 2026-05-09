@@ -1,0 +1,15 @@
+TOOLS = [
+    {"name": "search_recent_comments", "risk_level": "READ_ONLY"},
+    {"name": "get_live_products", "risk_level": "READ_ONLY"},
+    {"name": "get_product_detail", "risk_level": "READ_ONLY"},
+    {"name": "get_product_inventory", "risk_level": "READ_ONLY"},
+    {"name": "get_coupon_detail", "risk_level": "READ_ONLY"},
+    {"name": "search_policy_docs", "risk_level": "READ_ONLY"},
+    {"name": "create_ops_alert", "risk_level": "LOW_RISK_WRITE"},
+    {"name": "create_speaker_note", "risk_level": "LOW_RISK_WRITE"},
+    {"name": "create_approval_task", "risk_level": "LOW_RISK_WRITE"},
+    {"name": "send_owncast_system_message", "risk_level": "HIGH_RISK_WRITE"},
+    {"name": "change_coupon_time", "risk_level": "DESTRUCTIVE"},
+    {"name": "change_product_price", "risk_level": "DESTRUCTIVE"},
+    {"name": "hide_product_from_live", "risk_level": "HIGH_RISK_WRITE"},
+]

@@ -1,0 +1,29 @@
+services:
+  owncast:
+    image: owncast/owncast:latest
+    ports:
+      - "8080:8080"
+      - "1935:1935"
+    volumes:
+      - ./owncast_data:/app/data
+
+  meerkat-backend:
+    image: python:3.11-slim
+    working_dir: /app
+    command: >
+      sh -c "pip install -e . &&
+             python -m app.db.init_db &&
+             python -m app.db.seed &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8018"
+    ports:
+      - "8018:8018"
+    environment:
+      MEERKAT_DATABASE_URL: "sqlite+aiosqlite:///./meerkat.db"
+      OWNCAST_BASE_URL: "http://owncast:8080"
+      OWNCAST_ACCESS_TOKEN: "${OWNCAST_ACCESS_TOKEN:-}"
+      MEERKAT_AUTO_SEND_OWNCAST: "false"
+    volumes:
+      - ./meerkat_backend:/app
+      - ./meerkat_agent:/meerkat_agent
+    depends_on:
+      - owncast

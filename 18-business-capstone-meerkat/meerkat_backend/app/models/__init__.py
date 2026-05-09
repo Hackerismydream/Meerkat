@@ -1,0 +1,31 @@
+from app.db.base import (
+    ActionProposal,
+    AgentActionLog,
+    AgentRun,
+    AgentTask,
+    ApprovalTask,
+    Coupon,
+    LiveComment,
+    LiveSession,
+    LiveSessionProduct,
+    OpsAlert,
+    OwncastEvent,
+    Product,
+    SkuInventory,
+)
+
+__all__ = [
+    "ActionProposal",
+    "AgentActionLog",
+    "AgentRun",
+    "AgentTask",
+    "ApprovalTask",
+    "Coupon",
+    "LiveComment",
+    "LiveSession",
+    "LiveSessionProduct",
+    "OpsAlert",
+    "OwncastEvent",
+    "Product",
+    "SkuInventory",
+]
