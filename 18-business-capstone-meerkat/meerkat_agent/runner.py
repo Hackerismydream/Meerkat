@@ -15,6 +15,7 @@ from app.services.post_live_report_service import create_post_live_report
 from meerkat_agent.runtime.schemas import AgentTool
 from meerkat_agent.runtime.tool_registry import ToolRegistry
 from meerkat_agent.tools.meerkat_tools import MeerkatTools
+from meerkat_agent.tools.owncast_tools import send_owncast_system_message
 
 
 class MeerkatAgentRunner:
@@ -61,20 +62,25 @@ class MeerkatAgentRunner:
 
         tools = MeerkatTools(self.db, task.trace_id, settings.knowledge_dir)
         registry = ToolRegistry(self.db, task.trace_id, task.session_id)
-        for name, risk, handler in [
-            ("search_recent_comments", "READ_ONLY", tools.search_recent_comments),
-            ("get_live_products", "READ_ONLY", tools.get_live_products),
-            ("get_product_detail", "READ_ONLY", tools.get_product_detail),
-            ("get_product_inventory", "READ_ONLY", tools.get_product_inventory),
-            ("get_coupon_detail", "READ_ONLY", tools.get_coupon_detail),
-            ("get_stream_incident_context", "READ_ONLY", tools.get_stream_incident_context),
-            ("search_policy_docs", "READ_ONLY", tools.search_policy_docs),
-            ("create_ops_alert", "LOW_RISK_WRITE", tools.create_ops_alert),
-            ("create_speaker_note", "LOW_RISK_WRITE", tools.create_speaker_note),
-            ("create_action_proposal", "LOW_RISK_WRITE", tools.create_action_proposal),
-            ("create_approval_task", "LOW_RISK_WRITE", tools.create_approval_task),
+        for tool in [
+            AgentTool("search_recent_comments", "READ_ONLY", "Search recent live comments.", tools.search_recent_comments, input_schema={"required": ["session_id"]}),
+            AgentTool("get_live_products", "READ_ONLY", "Get live-session product context.", tools.get_live_products, input_schema={"required": ["session_id"]}),
+            AgentTool("get_product_detail", "READ_ONLY", "Get product detail.", tools.get_product_detail, input_schema={"required": ["product_id"]}),
+            AgentTool("get_product_inventory", "READ_ONLY", "Get SKU inventory.", tools.get_product_inventory, input_schema={"required": ["product_id"]}),
+            AgentTool("get_coupon_detail", "READ_ONLY", "Get coupon detail.", tools.get_coupon_detail, input_schema={"required": ["coupon_id"]}),
+            AgentTool("get_stream_incident_context", "READ_ONLY", "Get stream incident context.", tools.get_stream_incident_context, input_schema={"required": ["stream_incident_id"]}),
+            AgentTool("search_policy_docs", "READ_ONLY", "Search local policy docs.", tools.search_policy_docs, input_schema={"required": ["query"]}),
+            AgentTool("create_ops_alert", "LOW_RISK_WRITE", "Create an operations alert.", tools.create_ops_alert, input_schema={"required": ["session_id", "alert_type", "severity", "title", "summary", "evidence"]}),
+            AgentTool("create_speaker_note", "LOW_RISK_WRITE", "Create a speaker note.", tools.create_speaker_note, input_schema={"required": ["session_id", "body"]}),
+            AgentTool("create_action_proposal", "LOW_RISK_WRITE", "Create an action proposal.", tools.create_action_proposal, input_schema={"required": ["session_id", "action_type", "risk_level", "arguments", "reason"]}),
+            AgentTool("create_approval_task", "LOW_RISK_WRITE", "Create a human approval task.", tools.create_approval_task, input_schema={"required": ["session_id", "title", "reason", "payload"]}),
+            AgentTool("send_owncast_system_message", "MEDIUM_RISK_WRITE", "Send or dry-run an Owncast system chat message.", send_owncast_system_message, input_schema={"required": ["body"]}, allowed_agents=["script", "commander"]),
+            AgentTool("change_coupon_time", "DESTRUCTIVE", "Change coupon activation time.", allowed_agents=["risk"], requires_approval=True, input_schema={"required": ["session_id", "coupon_id", "proposal_id"]}),
+            AgentTool("change_product_price", "DESTRUCTIVE", "Change product price.", allowed_agents=["risk"], requires_approval=True, input_schema={"required": ["session_id", "product_id", "proposal_id"]}),
+            AgentTool("hide_product_from_live", "HIGH_RISK_WRITE", "Hide a product from live room.", allowed_agents=["risk"], requires_approval=True, input_schema={"required": ["session_id", "product_id"]}),
+            AgentTool("stop_stream", "DESTRUCTIVE", "Stop the livestream.", allowed_agents=["risk"], requires_approval=True, input_schema={"required": ["session_id"]}),
         ]:
-            registry.register(AgentTool(name=name, risk_level=risk, description=name, handler=handler))
+            registry.register(tool)
 
         if task.task_type == "STREAM_HEALTH_ANALYSIS":
             return await self._handle_stream_health(task, registry, input_payload.get("stream_incident_id"))
@@ -308,19 +314,18 @@ class MeerkatAgentRunner:
         note = await registry.call("create_speaker_note", {"session_id": task.session_id, "alert_id": alert["id"], "body": note_body, "target": "anchor"}, agent_name="script")
         await write_log(self.db, trace_id=task.trace_id, session_id=task.session_id, agent_name="script", parent_agent_name="commander", action_type="SPEAKER_NOTE_CREATED", output_data={"speaker_note_id": note["id"]})
         approval = await registry.call(
-            "create_approval_task",
+            "change_coupon_time",
             {
                 "session_id": task.session_id,
                 "proposal_id": proposal["id"],
-                "title": "审批优惠券提前生效",
                 "reason": "修改优惠券生效时间属于破坏性动作，Meerkat Agent 只创建审批任务。",
-                "payload": {"forbidden_tool": "change_coupon_time", "coupon_id": coupon_id},
-                "risk_level": "DESTRUCTIVE",
+                "coupon_id": coupon_id,
+                "requested_change": "start_now",
             },
             agent_name="risk",
         )
-        await write_log(self.db, trace_id=task.trace_id, session_id=task.session_id, agent_name="risk", parent_agent_name="commander", action_type="APPROVAL_CREATED", output_data={"approval_task_id": approval["id"]}, risk_level="DESTRUCTIVE")
-        return self._result(task, AlertType.COUPON_UNAVAILABLE, ["search_recent_comments", "get_live_products", "get_coupon_detail", "search_policy_docs", "create_ops_alert", "create_action_proposal", "create_speaker_note", "create_approval_task"], alert, note, approval, "DESTRUCTIVE")
+        await registry.call("send_owncast_system_message", {"body": note_body}, agent_name="script")
+        return self._result(task, AlertType.COUPON_UNAVAILABLE, ["search_recent_comments", "get_live_products", "get_coupon_detail", "search_policy_docs", "create_ops_alert", "create_action_proposal", "create_speaker_note", "create_approval_task", "send_owncast_system_message"], alert, note, approval, "DESTRUCTIVE")
 
     async def _handle_inventory(self, task: AgentTask, registry: ToolRegistry, comment_ids: list[int], product_id: int) -> dict[str, Any]:
         await self._dispatch(task, "product", {"product_id": product_id})
@@ -414,18 +419,16 @@ class MeerkatAgentRunner:
             agent_name="risk",
         )
         approval = await registry.call(
-            "create_approval_task",
+            "change_product_price",
             {
                 "session_id": task.session_id,
                 "proposal_id": proposal["id"],
-                "title": "审批价格口径处理方案",
                 "reason": "改价属于破坏性动作，Agent 不直接执行 change_product_price。",
-                "payload": {"forbidden_tool": "change_product_price", "product_id": product_id},
-                "risk_level": "DESTRUCTIVE",
+                "product_id": product_id,
+                "requested_price": product.get("script_price"),
             },
             agent_name="risk",
         )
-        await write_log(self.db, trace_id=task.trace_id, session_id=task.session_id, agent_name="risk", parent_agent_name="commander", action_type="APPROVAL_CREATED", output_data={"approval_task_id": approval["id"]}, risk_level="DESTRUCTIVE")
         return self._result(task, AlertType.PRICE_MISMATCH, ["search_recent_comments", "get_live_products", "get_product_detail", "search_policy_docs", "create_ops_alert", "create_speaker_note", "create_action_proposal", "create_approval_task"], alert, note, approval, "DESTRUCTIVE")
 
     async def _policy(self, task: AgentTask, registry: ToolRegistry, query: str) -> dict[str, Any]:

@@ -15,13 +15,14 @@ Meerkat：狐獴哨兵，直播间运营异常处理多智能体系统
 The core shape is agent-first:
 
 ```text
-Owncast CHAT / simulated comments
+Owncast CHAT / Owncast status + HLS probe / simulated comments
   -> Meerkat Backend saves comments
   -> deterministic classifier marks candidate anomaly
   -> anomaly window creates AgentTask
   -> MeerkatAgentRunner creates AgentRun
   -> commander dispatches live_triage / product / coupon / policy / risk / script
-  -> ToolRegistry executes tools
+  -> ToolRegistry executes read/low-risk tools
+  -> ToolRegistry blocks destructive tools and creates approval tasks
   -> tools create ops_alerts / action_proposals / speaker_notes / approval_tasks
   -> agent_action_logs records trace
 ```
@@ -33,6 +34,7 @@ The detector does not directly create final alerts, speaker notes, or approval t
 ### Owncast integration
 
 - Added `docker-compose.yml` with Owncast on ports `8080` and `1935`.
+- Added `extra_hosts` for `host.docker.internal` so Owncast-in-Docker can call a host backend.
 - Added `POST /api/v1/integrations/owncast/webhook`.
 - Configured Owncast Admin API webhook id `1`:
 
@@ -110,8 +112,27 @@ Current tools:
 - `create_action_proposal`
 - `create_speaker_note`
 - `create_approval_task`
+- `send_owncast_system_message`
+- `change_coupon_time` approval-only
+- `change_product_price` approval-only
+- `hide_product_from_live` approval-only
+- `stop_stream` approval-only
 
-High-risk or destructive operations such as `change_coupon_time`, `change_product_price`, and `hide_product_from_live` are not executed. They are represented as forbidden or approval-only actions.
+High-risk or destructive operations such as `change_coupon_time`, `change_product_price`, `hide_product_from_live`, and `stop_stream` are registered in ToolRegistry with schemas, allowed agents, and approval gates. Calling them returns `APPROVAL_REQUIRED`, creates a pending `approval_task`, and does not execute a destructive handler.
+
+`send_owncast_system_message` is registered as a medium-risk write tool. By default it records an Owncast dry-run trace instead of sending, controlled by `OWNCAST_DRY_RUN` and `OWNCAST_AUTO_SEND`.
+
+### Stream probe and Console APIs
+
+Implemented:
+
+- `POST /api/v1/stream/probe/run-once`
+- `GET /api/v1/stream/health/latest`
+- `GET /api/v1/stream/incidents`
+- `GET /api/v1/dashboard/summary`
+- `GET /api/v1/traces/{trace_id}/timeline`
+
+`run-once` probes Owncast `/api/status` and the HLS playlist, persists stream health samples, and triggers `stream_monitor_agent` when failures cross the incident threshold.
 
 ### Multi-agent roles
 
@@ -153,10 +174,11 @@ Current behavior:
 
 ```text
 coupon demo:
-  tools = search_recent_comments,get_live_products,get_coupon_detail,search_policy_docs,create_ops_alert,create_action_proposal,create_speaker_note,create_approval_task
+  tools = search_recent_comments,get_live_products,get_coupon_detail,search_policy_docs,create_ops_alert,create_action_proposal,create_speaker_note,create_approval_task,send_owncast_system_message
   creates COUPON_UNAVAILABLE alert
   creates speaker note
   creates DESTRUCTIVE approval
+  records OWNCAST_MESSAGE_DRY_RUN
   does not execute change_coupon_time
 
 inventory demo:
@@ -203,21 +225,23 @@ Eval checks agent behavior, not just database rows:
 Latest local eval output:
 
 ```text
-alert_type_accuracy = 1.00
-subagent_dispatch_coverage = 1.00
-tool_selection_accuracy = 1.00
-tool_call_recall = 1.00
-tool_call_precision = 1.00
+alert_type_accuracy = 0.94
+subagent_dispatch_coverage = 0.96
+tool_selection_accuracy = 0.96
+tool_call_recall = 0.96
+tool_call_precision = 0.96
 tool_execution_success_rate = 1.00
 forbidden_tool_block_rate = 1.00
-risk_gate_accuracy = 1.00
+risk_gate_accuracy = 0.96
 approval_trigger_accuracy = 1.00
-policy_grounding_accuracy = 1.00
-speaker_note_created_rate = 1.00
+policy_grounding_accuracy = 0.94
+speaker_note_created_rate = 0.96
 trace_completeness = 1.00
-p95_end_to_end_latency = 22 ms
-avg_agent_steps_per_alert = 31.33
+p95_end_to_end_latency = 88 ms
+avg_agent_steps_per_alert = 23.20
 ```
+
+Known failed cases remain `inventory_003`, `inventory_006`, and `known_gap_mixed_001`.
 
 ### Docs and repo integration
 
@@ -243,7 +267,7 @@ From `18-business-capstone-meerkat/meerkat_backend`:
 Result:
 
 ```text
-5 passed in 0.41s
+16 passed in 1.17s
 ```
 
 From `18-business-capstone-meerkat/meerkat_agent/evals`:
@@ -252,7 +276,7 @@ From `18-business-capstone-meerkat/meerkat_agent/evals`:
 ../../meerkat_backend/.venv/bin/python run_eval.py
 ```
 
-Result: all listed eval metrics above were `1.00`, with p95 latency `22 ms`.
+Result: metrics listed above, with known gaps still visible in `meerkat_agent/evals/report.md`.
 
 Demo scripts run successfully:
 
@@ -260,6 +284,7 @@ Demo scripts run successfully:
 .venv/bin/python ../scripts/run_demo_coupon.py
 .venv/bin/python ../scripts/run_demo_inventory.py
 .venv/bin/python ../scripts/run_demo_price.py
+../meerkat_backend/.venv/bin/python ../scripts/run_demo_owncast_message.py
 ```
 
 Web build was verified from `web/`:
@@ -355,12 +380,11 @@ versionNumber = 0.2.5
 online = false
 ```
 
-Meerkat Backend is running locally:
+Meerkat Backend was started temporarily for HTTP smoke and then stopped:
 
 ```text
 http://127.0.0.1:8018
-process pid = 81387
-command = .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8018
+command = .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8018
 ```
 
 Health endpoint returns:

@@ -40,6 +40,12 @@ class StreamHealthSimulationRequest(BaseModel):
     samples: list[StreamHealthSampleInput] = Field(default_factory=list)
 
 
+class StreamProbeRunOnceRequest(BaseModel):
+    session_id: int = 1
+    owncast_base_url: str | None = None
+    hls_playlist_url: str | None = None
+
+
 class PostLiveReportRequest(BaseModel):
     session_id: int = 1
 

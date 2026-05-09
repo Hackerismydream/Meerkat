@@ -4,6 +4,8 @@ services:
     ports:
       - "8080:8080"
       - "1935:1935"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./owncast_data:/app/data
 
@@ -20,8 +22,15 @@ services:
     environment:
       MEERKAT_DATABASE_URL: "sqlite+aiosqlite:///./meerkat.db"
       OWNCAST_BASE_URL: "http://owncast:8080"
+      OWNCAST_PUBLIC_URL: "http://localhost:8080"
+      OWNCAST_WEBHOOK_URL: "http://meerkat-backend:8018/api/v1/integrations/owncast/webhook"
       OWNCAST_ACCESS_TOKEN: "${OWNCAST_ACCESS_TOKEN:-}"
-      MEERKAT_AUTO_SEND_OWNCAST: "false"
+      OWNCAST_DRY_RUN: "${OWNCAST_DRY_RUN:-true}"
+      OWNCAST_AUTO_SEND: "${OWNCAST_AUTO_SEND:-false}"
+      MEERKAT_BACKEND_URL: "http://meerkat-backend:8018"
+      STREAM_PROBE_ENABLED: "${STREAM_PROBE_ENABLED:-false}"
+      STREAM_PROBE_INTERVAL_SECONDS: "${STREAM_PROBE_INTERVAL_SECONDS:-10}"
+      HLS_PLAYLIST_URL: "http://owncast:8080/hls/stream.m3u8"
     volumes:
       - ./meerkat_backend:/app
       - ./meerkat_agent:/meerkat_agent

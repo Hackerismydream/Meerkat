@@ -9,13 +9,13 @@ Meerkat 不是从零实现直播系统，而是接入开源直播服务 Owncast�
 ## Architecture
 
 ```text
-Owncast CHAT / stream probe / simulated comments
+Owncast CHAT / Owncast status + HLS probe / simulated comments
   -> Meerkat Backend saves comments
   -> deterministic classifier / stream detector creates candidate anomaly
   -> AgentTask
   -> commander agent
   -> stream_monitor / live_triage / product / coupon / policy / risk / script / report agents
-  -> ToolRegistry
+  -> ToolRegistry schema / allowed-agent / approval guard
   -> stream_incidents / ops_alerts / speaker_notes / approval_tasks / post_live_reports / agent_action_logs
 ```
 
@@ -41,6 +41,16 @@ python -m app.db.seed
 uvicorn app.main:app --host 0.0.0.0 --port 8018 --reload
 ```
 
+Equivalent Make targets:
+
+```bash
+make owncast-up
+make backend-setup
+make backend
+make check-owncast
+make check-backend
+```
+
 Open:
 
 ```text
@@ -63,6 +73,39 @@ The webhook parser tolerates missing fields and accepts the common Owncast shape
 {"type":"CHAT","eventData":{"body":"券领不了","user":{"displayName":"viewer001"}}}
 ```
 
+Local smoke test:
+
+```bash
+make smoke-webhook
+python scripts/setup_owncast_webhook.py
+```
+
+`setup_owncast_webhook.py` first verifies `GET /api/admin/webhooks`. It does not guess a write endpoint for the current Owncast version.
+
+## Stream Probe
+
+Real probe path:
+
+```text
+POST /api/v1/stream/probe/run-once
+  -> GET Owncast /api/status
+  -> GET HLS playlist
+  -> persist stream_probe_runs / stream_health_samples
+  -> create StreamIncident when failed samples cross threshold
+  -> trigger stream_monitor_agent
+```
+
+Useful commands:
+
+```bash
+make ffmpeg-stream
+make ffmpeg-no-audio
+make probe-hls
+make probe-ffprobe
+```
+
+`/api/v1/stream/health/latest`, `/api/v1/stream/incidents`, `/api/v1/dashboard/summary`, and `/api/v1/traces/{trace_id}/timeline` provide the Console-facing state.
+
 ## Demos Without Owncast
 
 ```bash
@@ -83,7 +126,8 @@ Coupon unavailable:
 ```text
 comments -> COUPON_UNAVAILABLE -> get_live_products -> get_coupon_detail
 -> search_policy_docs -> create_ops_alert -> create_action_proposal
--> create_speaker_note -> create_approval_task
+-> create_speaker_note -> ToolRegistry blocks change_coupon_time
+-> create_approval_task -> send_owncast_system_message dry-run
 ```
 
 Inventory unavailable:
@@ -124,9 +168,9 @@ ops_alerts / stream_incidents / speaker_notes / approvals
 | Event-driven Agent Workflow | Owncast CHAT webhook, simulated comments, and stream health probes trigger AgentTask |
 | Tool Calling | comments, products, inventory, coupons, alerts, speaker notes, approvals are Agent tools |
 | Multi-Agent Dispatch | commander dispatches stream_monitor / live_triage / product / coupon / policy / risk / script / report |
-| Stream Health | HLS/ffprobe-style samples create stream incidents and stream_monitor_agent tasks |
+| Stream Health | Owncast status and HLS probes create stream incidents and stream_monitor_agent tasks |
 | RAG / SOP Grounding | policy_agent searches `meerkat_agent/knowledge/*.md` |
-| Human-in-the-loop | price changes, coupon time changes, product hiding, and system messages are blocked or moved to approval |
+| Human-in-the-loop | ToolRegistry blocks destructive tools and creates approval tasks instead of executing them |
 | Trace / Observability | `agent_action_logs` records subagent dispatch, tool calls, policy retrieval, risk decisions, and final actions |
 | Eval | `cases.jsonl` and graders verify subagent dispatch, tool choice, tool execution, forbidden tools, risk gate, approval trigger, policy grounding, and trace completeness |
 | Concurrency / Dedupe | anomaly windows and open-alert checks prevent repeated alerts for the same active issue |
@@ -142,7 +186,9 @@ Trace tr_...
 5. commander -> create_ops_alert
 6. risk -> create_action_proposal
 7. script -> create_speaker_note
-8. risk -> create_approval_task
+8. risk -> APPROVAL_REQUIRED(change_coupon_time)
+9. risk -> create_approval_task
+10. script -> send_owncast_system_message(dry_run)
 ```
 
 Query trace logs:
@@ -185,7 +231,7 @@ Known failed cases are documented in `meerkat_agent/evals/report.md`; current ga
 | READ_ONLY | execute directly |
 | LOW_RISK_WRITE | execute and audit |
 | HIGH_RISK_WRITE | dry-run or approval |
-| DESTRUCTIVE | blocked; create approval instead |
+| DESTRUCTIVE | ToolRegistry returns `APPROVAL_REQUIRED`; no destructive handler runs |
 
 ## Resume
 

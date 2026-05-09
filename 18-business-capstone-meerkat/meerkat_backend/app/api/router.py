@@ -37,12 +37,14 @@ from app.schemas import (
     SimulationRequest,
     SimulationResponse,
     StreamHealthSimulationRequest,
+    StreamProbeRunOnceRequest,
 )
 from app.services.agent_task_service import create_agent_task, run_agent_task
 from app.services.owncast_webhook_service import handle as handle_owncast_webhook
 from app.services.serialization import dumps, model_to_dict
 from app.services.simulation_service import insert_comments_and_run_agent
 from app.services.stream_health_service import simulate_stream_health
+from app.services.stream_probe_service import run_stream_probe_once
 
 router = APIRouter(prefix="/api/v1")
 
@@ -70,6 +72,19 @@ async def simulate_comments(payload: SimulationRequest, session: AsyncSession = 
 async def simulate_stream_health_endpoint(payload: StreamHealthSimulationRequest, session: AsyncSession = Depends(get_session)) -> dict:
     try:
         return await simulate_stream_health(session, session_id=payload.session_id, scenario=payload.scenario, samples=payload.samples)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/stream/probe/run-once")
+async def stream_probe_run_once(payload: StreamProbeRunOnceRequest, session: AsyncSession = Depends(get_session)) -> dict:
+    try:
+        return await run_stream_probe_once(
+            session,
+            session_id=payload.session_id,
+            owncast_base_url=payload.owncast_base_url,
+            hls_playlist_url=payload.hls_playlist_url,
+        )
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -406,10 +421,24 @@ async def replay_trace(trace_id: str, session: AsyncSession = Depends(get_sessio
     }
 
 
+@router.get("/traces/{trace_id}/timeline")
+async def trace_timeline(trace_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    logs = list((await session.scalars(select(AgentActionLog).where(AgentActionLog.trace_id == trace_id).order_by(AgentActionLog.id.asc()))).all())
+    if not logs:
+        raise HTTPException(404, "trace not found")
+    return {"trace_id": trace_id, "events": [model_to_dict(log) for log in logs]}
+
+
 @router.get("/stream-health/samples")
 async def list_stream_health_samples(session_id: int = 1, session: AsyncSession = Depends(get_session)) -> dict:
     samples = list((await session.scalars(select(StreamHealthSample).where(StreamHealthSample.session_id == session_id).order_by(StreamHealthSample.id.desc()).limit(50))).all())
     return {"items": [model_to_dict(sample) for sample in samples]}
+
+
+@router.get("/stream/health/latest")
+async def latest_stream_health(session_id: int = 1, session: AsyncSession = Depends(get_session)) -> dict:
+    sample = await session.scalar(select(StreamHealthSample).where(StreamHealthSample.session_id == session_id).order_by(StreamHealthSample.id.desc()).limit(1))
+    return {"item": model_to_dict(sample) if sample else None}
 
 
 @router.get("/stream-incidents")
@@ -419,6 +448,49 @@ async def list_stream_incidents(session_id: int = 1, status: str | None = None, 
         query = query.where(StreamIncident.status == status)
     incidents = list((await session.scalars(query)).all())
     return {"items": [model_to_dict(incident) for incident in incidents]}
+
+
+@router.get("/stream/incidents")
+async def list_stream_incidents_alias(session_id: int = 1, status: str | None = None, session: AsyncSession = Depends(get_session)) -> dict:
+    return await list_stream_incidents(session_id=session_id, status=status, session=session)
+
+
+@router.get("/dashboard/summary")
+async def dashboard_summary(session_id: int = 1, session: AsyncSession = Depends(get_session)) -> dict:
+    live_session = await session.get(LiveSession, session_id)
+    if not live_session:
+        raise HTTPException(404, "live session not found")
+    latest_sample = await session.scalar(select(StreamHealthSample).where(StreamHealthSample.session_id == session_id).order_by(StreamHealthSample.id.desc()).limit(1))
+    comments = list((await session.scalars(select(LiveComment).where(LiveComment.session_id == session_id).order_by(LiveComment.id.desc()).limit(10))).all())
+    incidents = list((await session.scalars(select(StreamIncident).where(StreamIncident.session_id == session_id).order_by(StreamIncident.id.desc()).limit(10))).all())
+    alerts = list((await session.scalars(select(OpsAlert).where(OpsAlert.session_id == session_id).order_by(OpsAlert.id.desc()).limit(10))).all())
+    notes = list((await session.scalars(select(SpeakerNote).where(SpeakerNote.session_id == session_id).order_by(SpeakerNote.id.desc()).limit(10))).all())
+    approvals = list((await session.scalars(select(ApprovalTask).where(ApprovalTask.session_id == session_id).order_by(ApprovalTask.id.desc()).limit(10))).all())
+    runs = list(
+        (
+            await session.scalars(
+                select(AgentRun)
+                .join(AgentTask, AgentTask.id == AgentRun.task_id)
+                .where(AgentTask.session_id == session_id)
+                .order_by(AgentRun.id.desc())
+                .limit(10)
+            )
+        ).all()
+    )
+    logs = list((await session.scalars(select(AgentActionLog).where(AgentActionLog.session_id == session_id).order_by(AgentActionLog.id.desc()).limit(20))).all())
+    return {
+        "live_session": model_to_dict(live_session),
+        "comments": {"recent": [model_to_dict(comment) for comment in comments]},
+        "stream_health": {"latest_sample": model_to_dict(latest_sample) if latest_sample else None},
+        "stream_incidents": {"items": [model_to_dict(incident) for incident in incidents]},
+        "ops_alerts": {"items": [model_to_dict(alert) for alert in alerts]},
+        "speaker_notes": {"items": [model_to_dict(note) for note in notes]},
+        "approvals": {"items": [model_to_dict(approval) for approval in approvals]},
+        "agent": {
+            "recent_runs": [model_to_dict(run) for run in runs],
+            "recent_events": [model_to_dict(log) for log in logs],
+        },
+    }
 
 
 dashboard_router = APIRouter()

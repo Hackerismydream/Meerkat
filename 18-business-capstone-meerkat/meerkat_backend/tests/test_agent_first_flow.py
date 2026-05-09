@@ -6,6 +6,7 @@ from app.db.seed import seed_database
 from app.main import app
 from app.db.session import SessionLocal
 from app.db.base import (
+    ApprovalTask,
     CommentCluster,
     LiveComment,
     LiveRoom,
@@ -18,6 +19,7 @@ from app.db.base import (
     StreamIncident,
 )
 from sqlalchemy import select
+from meerkat_agent.tools import owncast_tools
 
 
 @pytest.fixture(autouse=True)
@@ -100,6 +102,76 @@ async def test_coupon_simulation_creates_business_objects_through_agent_tools():
     assert proposals[0]["risk_level"] == "DESTRUCTIVE"
     assert approvals[0]["title"].startswith("审批优惠券")
     assert approvals[0]["proposal_id"] == proposals[0]["id"]
+
+
+@pytest.mark.asyncio
+async def test_coupon_flow_blocks_high_risk_tool_inside_tool_registry_and_dry_runs_owncast_message():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/simulations/comments",
+            json={
+                "session_id": 1,
+                "comments": [
+                    {"user_name": "u1", "body": "券领不了"},
+                    {"user_name": "u2", "body": "为什么没有 50 元券"},
+                    {"user_name": "u3", "body": "点进去没有券啊"},
+                ],
+            },
+        )
+        payload = response.json()
+        logs = (
+            await client.get(
+                "/api/v1/agent-action-logs",
+                params={"trace_id": payload["trace_id"]},
+            )
+        ).json()["items"]
+
+    assert response.status_code == 200
+    action_types = [log["action_type"] for log in logs]
+    approval_events = [log for log in logs if log["action_type"] == "APPROVAL_REQUIRED"]
+    owncast_events = [log for log in logs if log["action_type"] == "OWNCAST_MESSAGE_DRY_RUN"]
+    executed_tools = [log["tool_name"] for log in logs if log["action_type"] == "TOOL_RESULT"]
+
+    assert "APPROVAL_REQUIRED" in action_types
+    assert approval_events[0]["tool_name"] == "change_coupon_time"
+    assert approval_events[0]["output"]["status"] == "APPROVAL_REQUIRED"
+    assert "change_coupon_time" not in executed_tools
+    assert owncast_events
+    assert owncast_events[0]["output"]["dry_run"] is True
+
+    async with SessionLocal() as session:
+        approvals = list((await session.scalars(select(ApprovalTask))).all())
+
+    assert approvals[0].status == "PENDING"
+    assert approvals[0].risk_level == "DESTRUCTIVE"
+
+
+@pytest.mark.asyncio
+async def test_owncast_system_message_failure_is_not_logged_as_sent(monkeypatch):
+    class Response:
+        status_code = 401
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(owncast_tools.settings, "owncast_dry_run", False)
+    monkeypatch.setattr(owncast_tools.settings, "auto_send_owncast", True)
+    monkeypatch.setattr(owncast_tools.settings, "owncast_access_token", "bad-token")
+    monkeypatch.setattr(owncast_tools.httpx, "AsyncClient", lambda **_kwargs: Client())
+
+    result = await owncast_tools.send_owncast_system_message("hello", dry_run=False)
+
+    assert result["dry_run"] is True
+    assert result["status_code"] == 401
+    assert "Owncast returned 401" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -275,6 +347,58 @@ async def test_owncast_stream_stopped_webhook_triggers_stream_monitor_agent():
 
 
 @pytest.mark.asyncio
+async def test_stream_probe_run_once_uses_real_probe_failure_path_and_triggers_agent():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/stream/probe/run-once",
+            json={
+                "session_id": 1,
+                "owncast_base_url": "http://127.0.0.1:1",
+                "hls_playlist_url": "http://127.0.0.1:1/hls/stream.m3u8",
+            },
+        )
+        payload = response.json()
+        latest = (await client.get("/api/v1/stream/health/latest", params={"session_id": 1})).json()
+
+    assert response.status_code == 200
+    assert payload["incident_type"] == "STREAM_INTERRUPTED"
+    assert payload["trace_id"]
+    assert latest["item"]["probe_status"] == "FAILED"
+    assert "127.0.0.1:1" in latest["item"]["probe_error"]
+
+
+@pytest.mark.asyncio
+async def test_stream_probe_run_once_uses_ffprobe_audio_metadata(monkeypatch):
+    async def fake_owncast_status(_base_url: str) -> dict:
+        return {"probe_type": "OWNCAST_STATUS", "status": "OK", "duration_ms": 1, "is_live": True, "raw": {}, "error": None}
+
+    async def fake_hls_playlist(_playlist_url: str) -> dict:
+        return {"probe_type": "HLS_PLAYLIST", "status": "OK", "duration_ms": 1, "last_segment_age_ms": 0, "error": None}
+
+    async def fake_ffprobe(_media_url: str) -> dict:
+        return {"probe_type": "FFPROBE", "status": "OK", "duration_ms": 1, "video_present": True, "audio_present": False, "error": None}
+
+    monkeypatch.setattr("app.services.stream_probe_service.probe_owncast_status", fake_owncast_status)
+    monkeypatch.setattr("app.services.stream_probe_service.probe_hls_playlist", fake_hls_playlist)
+    monkeypatch.setattr("app.services.stream_probe_service.probe_ffprobe_stream", fake_ffprobe)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/stream/probe/run-once",
+            json={"session_id": 1, "owncast_base_url": "http://owncast", "hls_playlist_url": "http://owncast/hls/stream.m3u8"},
+        )
+        payload = response.json()
+        latest = (await client.get("/api/v1/stream/health/latest", params={"session_id": 1})).json()
+
+    assert response.status_code == 200
+    assert payload["incident_type"] == "NO_AUDIO"
+    assert payload["probe"]["ffprobe"]["audio_present"] is False
+    assert latest["item"]["audio_present"] is False
+
+
+@pytest.mark.asyncio
 async def test_single_noise_comment_does_not_create_cluster_or_agent_run():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -320,3 +444,46 @@ async def test_post_live_report_persists_markdown_and_memory_updates():
         reports = list((await session.scalars(select(PostLiveReport))).all())
 
     assert len(reports) == 1
+
+
+@pytest.mark.asyncio
+async def test_dashboard_summary_and_trace_timeline_api_show_console_sections():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        simulation = await client.post(
+            "/api/v1/simulations/stream-health",
+            json={
+                "session_id": 1,
+                "scenario": "no_audio",
+                "samples": [{"is_live": True, "audio_present": False, "probe_status": "OK"}],
+            },
+        )
+        trace_id = simulation.json()["trace_id"]
+        summary = (await client.get("/api/v1/dashboard/summary", params={"session_id": 1})).json()
+        timeline = (await client.get(f"/api/v1/traces/{trace_id}/timeline")).json()
+
+    assert summary["live_session"]["id"] == 1
+    assert summary["stream_health"]["latest_sample"]["audio_present"] is False
+    assert summary["stream_incidents"]["items"][0]["incident_type"] == "NO_AUDIO"
+    assert summary["agent"]["recent_runs"]
+    assert timeline["trace_id"] == trace_id
+    assert timeline["events"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_summary_scopes_agent_runs_to_session():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post("/api/v1/live-sessions", json={"title": "Second room"})
+        session_id = created.json()["id"]
+        await client.post(
+            "/api/v1/simulations/stream-health",
+            json={
+                "session_id": session_id,
+                "scenario": "no_audio",
+                "samples": [{"is_live": True, "audio_present": False, "probe_status": "OK"}],
+            },
+        )
+        summary = (await client.get("/api/v1/dashboard/summary", params={"session_id": 1})).json()
+
+    assert summary["agent"]["recent_runs"] == []
