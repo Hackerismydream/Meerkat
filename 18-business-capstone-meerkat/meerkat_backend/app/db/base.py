@@ -78,6 +78,7 @@ class ProductAlias(Base):
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
     session_id: Mapped[int | None] = mapped_column(ForeignKey("live_sessions.id"), nullable=True)
     alias: Mapped[str] = mapped_column(String(100))
+    alias_type: Mapped[str] = mapped_column(String(50), default="MANUAL")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -161,10 +162,27 @@ class CommentCluster(Base):
     evidence_comment_ids_json: Mapped[str] = mapped_column(Text)
     target_product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True)
     target_coupon_id: Mapped[int | None] = mapped_column(ForeignKey("coupons.id"), nullable=True)
+    target_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     summary: Mapped[str] = mapped_column(Text)
+    created_by_agent: Mapped[str] = mapped_column(String(100), default="comment_triage")
     trace_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class StreamProbeJob(Base):
+    __tablename__ = "stream_probe_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("live_sessions.id"))
+    status: Mapped[str] = mapped_column(String(50))
+    probe_interval_seconds: Mapped[int] = mapped_column(Integer, default=10)
+    failure_threshold: Mapped[int] = mapped_column(Integer, default=3)
+    recovery_threshold: Mapped[int] = mapped_column(Integer, default=3)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_tick_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(100), default="system")
 
 
 class StreamProbeRun(Base):
@@ -194,6 +212,8 @@ class StreamHealthSample(Base):
     width: Mapped[int | None] = mapped_column(Integer, nullable=True)
     height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_segment_age_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_segment_uri: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    playlist_hash: Mapped[str | None] = mapped_column(String(100), nullable=True)
     probe_status: Mapped[str] = mapped_column(String(50))
     probe_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     sampled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -207,6 +227,12 @@ class StreamIncident(Base):
     incident_type: Mapped[str] = mapped_column(String(50))
     severity: Mapped[str] = mapped_column(String(10))
     status: Mapped[str] = mapped_column(String(50))
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    recovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    dedupe_key: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    recovery_count: Mapped[int] = mapped_column(Integer, default=0)
     evidence_json: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str] = mapped_column(String(50))
     trace_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -244,6 +270,9 @@ class SpeakerNote(Base):
     body: Mapped[str] = mapped_column(Text)
     target: Mapped[str] = mapped_column(String(50))
     status: Mapped[str] = mapped_column(String(50))
+    send_status: Mapped[str] = mapped_column(String(50), default="NOT_SENT")
+    owncast_message_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    send_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[str] = mapped_column(String(50))
     trace_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

@@ -80,7 +80,10 @@ make smoke-webhook
 python scripts/setup_owncast_webhook.py
 ```
 
-`setup_owncast_webhook.py` first verifies `GET /api/admin/webhooks`. It does not guess a write endpoint for the current Owncast version.
+`setup_owncast_webhook.py --configure` first tries the Owncast Admin API. For
+the local Owncast version used here, if that write endpoint is unavailable it
+falls back to updating `owncast_data/owncast.db`, then Owncast should be
+restarted before `make check-owncast-webhook`.
 
 ## Stream Probe
 
@@ -99,10 +102,16 @@ Useful commands:
 
 ```bash
 make ffmpeg-stream
+make ffmpeg-stream-docker
+make ffmpeg-stream-stop
 make ffmpeg-no-audio
 make probe-hls
 make probe-ffprobe
 ```
+
+`make ffmpeg-stream` uses local `ffmpeg` when available and falls back to a
+Docker ffmpeg container. If Owncast opens but says the stream is offline, the
+Owncast service is up but no RTMP source is currently pushing.
 
 `/api/v1/stream/health/latest`, `/api/v1/stream/incidents`, `/api/v1/dashboard/summary`, and `/api/v1/traces/{trace_id}/timeline` provide the Console-facing state.
 
@@ -209,20 +218,22 @@ The eval checks Agent behavior quality across 50 cases: alert type, stream healt
 Latest local eval:
 
 ```text
-alert_type_accuracy = 0.94
-subagent_dispatch_coverage = 0.96
-tool_call_recall = 0.96
-tool_call_precision = 0.96
+alert_type_accuracy = 1.00
+subagent_dispatch_coverage = 1.00
+tool_selection_accuracy = 1.00
+tool_call_recall = 1.00
+tool_call_precision = 1.00
 tool_execution_success_rate = 1.00
 forbidden_tool_block_rate = 1.00
-risk_gate_accuracy = 0.96
+risk_gate_accuracy = 1.00
 approval_trigger_accuracy = 1.00
-policy_grounding_accuracy = 0.94
+policy_grounding_accuracy = 1.00
+speaker_note_created_rate = 1.00
 trace_completeness = 1.00
-p95_end_to_end_latency = 21 ms
+p95_end_to_end_latency = 35 ms
 ```
 
-Known failed cases are documented in `meerkat_agent/evals/report.md`; current gaps are natural inventory wording recall and mixed coupon + price split.
+Known failed cases are documented in `meerkat_agent/evals/report.md`; current local eval has no failed cases.
 
 ## Risk Levels
 

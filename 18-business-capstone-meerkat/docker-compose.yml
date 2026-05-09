@@ -10,16 +10,18 @@ services:
       - ./owncast_data:/app/data
 
   meerkat-backend:
-    image: python:3.11-slim
+    build:
+      context: .
+      dockerfile: meerkat_backend/Dockerfile
     working_dir: /app
     command: >
-      sh -c "pip install -e . &&
-             python -m app.db.init_db --reset &&
+      sh -c "python -m app.db.init_db --reset &&
              python -m app.db.seed &&
              uvicorn app.main:app --host 0.0.0.0 --port 8018"
     ports:
       - "8018:8018"
     environment:
+      PYTHONPATH: "/app"
       MEERKAT_DATABASE_URL: "sqlite+aiosqlite:///./meerkat.db"
       OWNCAST_BASE_URL: "http://owncast:8080"
       OWNCAST_PUBLIC_URL: "http://localhost:8080"
@@ -32,7 +34,7 @@ services:
       STREAM_PROBE_INTERVAL_SECONDS: "${STREAM_PROBE_INTERVAL_SECONDS:-10}"
       HLS_PLAYLIST_URL: "http://owncast:8080/hls/stream.m3u8"
     volumes:
-      - ./meerkat_backend:/app
-      - ./meerkat_agent:/meerkat_agent
+      - ./meerkat_backend/app:/app/app
+      - ./meerkat_agent:/app/meerkat_agent
     depends_on:
       - owncast

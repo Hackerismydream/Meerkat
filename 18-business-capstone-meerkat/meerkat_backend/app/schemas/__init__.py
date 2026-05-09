@@ -30,6 +30,8 @@ class StreamHealthSampleInput(BaseModel):
     width: int | None = None
     height: int | None = None
     last_segment_age_ms: int | None = None
+    last_segment_uri: str | None = None
+    playlist_hash: str | None = None
     probe_status: str = "OK"
     probe_error: str | None = None
 
@@ -44,6 +46,17 @@ class StreamProbeRunOnceRequest(BaseModel):
     session_id: int = 1
     owncast_base_url: str | None = None
     hls_playlist_url: str | None = None
+
+
+class StreamProbeJobRequest(BaseModel):
+    session_id: int = 1
+    probe_interval_seconds: int = 10
+    failure_threshold: int = 3
+    recovery_threshold: int = 3
+
+
+class StreamProbeTickRequest(BaseModel):
+    session_id: int = 1
 
 
 class PostLiveReportRequest(BaseModel):

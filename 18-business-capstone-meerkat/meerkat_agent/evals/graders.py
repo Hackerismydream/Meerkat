@@ -4,6 +4,9 @@ from __future__ import annotations
 def grade_alert_type(case: dict, alerts: list[dict]) -> float:
     if case.get("expected_no_alert"):
         return 1.0 if not alerts else 0.0
+    if case.get("expected_alert_type") == "MIXED_COUPON_AND_PRICE":
+        actual = {alert["alert_type"] for alert in alerts}
+        return 1.0 if {"COUPON_UNAVAILABLE", "PRICE_MISMATCH"} <= actual else 0.0
     return 1.0 if alerts and alerts[0]["alert_type"] == case["expected_alert_type"] else 0.0
 
 
@@ -61,6 +64,7 @@ def grade_policy_grounding(case: dict, logs: list[dict]) -> float:
 
 def grade_subagent_dispatch_coverage(case: dict, logs: list[dict]) -> float:
     required_by_type = {
+        "MIXED_COUPON_AND_PRICE": {"live_triage", "product", "coupon", "policy", "risk", "script"},
         "COUPON_UNAVAILABLE": {"live_triage", "product", "coupon", "policy", "risk", "script"},
         "INVENTORY_UNAVAILABLE": {"live_triage", "product", "policy", "risk", "script"},
         "PRICE_MISMATCH": {"live_triage", "product", "policy", "risk", "script"},

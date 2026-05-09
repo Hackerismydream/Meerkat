@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +22,7 @@ class ToolRegistry:
         self.session_id = session_id
         self.risk_guard = RiskGuard()
         self._tools: dict[str, AgentTool] = {}
+        self._idempotency_cache: dict[str, dict[str, Any]] = {}
 
     def register(self, tool: AgentTool) -> None:
         self._tools[tool.name] = tool
@@ -47,6 +50,22 @@ class ToolRegistry:
             return result
         if self._requires_approval(tool):
             return await self._create_approval_gate(tool, arguments, agent_name)
+        idempotency_key = self._idempotency_key(tool, arguments)
+        if idempotency_key and idempotency_key in self._idempotency_cache:
+            result = self._idempotency_cache[idempotency_key]
+            await write_log(
+                self.db,
+                trace_id=self.trace_id,
+                session_id=self.session_id,
+                agent_name=agent_name,
+                parent_agent_name="commander" if agent_name != "commander" else None,
+                action_type="IDEMPOTENCY_HIT",
+                tool_name=tool.name,
+                input_data=arguments,
+                output_data=result,
+                risk_level=tool.risk_level,
+            )
+            return result
 
         await write_log(
             self.db,
@@ -62,7 +81,44 @@ class ToolRegistry:
         with Timer() as timer:
             if tool.handler is None:
                 raise ValueError(f"tool {tool.name} has no handler")
-            result = await tool.handler(**arguments)
+            try:
+                async with asyncio.timeout(tool.timeout_ms / 1000):
+                    result = await tool.handler(**arguments)
+            except TimeoutError:
+                result = {"status": "TOOL_TIMEOUT", "tool_name": tool.name}
+                await write_log(
+                    self.db,
+                    trace_id=self.trace_id,
+                    session_id=self.session_id,
+                    agent_name=agent_name,
+                    parent_agent_name="commander" if agent_name != "commander" else None,
+                    action_type="TOOL_TIMEOUT",
+                    tool_name=tool.name,
+                    input_data=arguments,
+                    output_data=result,
+                    risk_level=tool.risk_level,
+                    status="FAILED",
+                    duration_ms=getattr(timer, "duration_ms", None),
+                )
+                return result
+        schema_error = self._validate_output_schema(tool, result)
+        if schema_error:
+            result = {"status": "TOOL_RESULT_SCHEMA_ERROR", "tool_name": tool.name, "error": schema_error, "output": result}
+            await write_log(
+                self.db,
+                trace_id=self.trace_id,
+                session_id=self.session_id,
+                agent_name=agent_name,
+                parent_agent_name="commander" if agent_name != "commander" else None,
+                action_type="TOOL_RESULT_SCHEMA_ERROR",
+                tool_name=tool.name,
+                input_data=arguments,
+                output_data=result,
+                risk_level=tool.risk_level,
+                status="FAILED",
+                duration_ms=timer.duration_ms,
+            )
+            return result
         await write_log(
             self.db,
             trace_id=self.trace_id,
@@ -76,14 +132,21 @@ class ToolRegistry:
             risk_level=tool.risk_level,
             duration_ms=timer.duration_ms,
         )
+        if idempotency_key:
+            self._idempotency_cache[idempotency_key] = result
         if tool.name == "send_owncast_system_message":
+            action = "OWNCAST_MESSAGE_SENT"
+            if result.get("status") == "DRY_RUN" or result.get("dry_run"):
+                action = "OWNCAST_MESSAGE_DRY_RUN"
+            elif result.get("status") == "FAILED":
+                action = "OWNCAST_MESSAGE_FAILED"
             await write_log(
                 self.db,
                 trace_id=self.trace_id,
                 session_id=self.session_id,
                 agent_name=agent_name,
                 parent_agent_name="commander" if agent_name != "commander" else None,
-                action_type="OWNCAST_MESSAGE_DRY_RUN" if result.get("dry_run") else "OWNCAST_MESSAGE_SENT",
+                action_type=action,
                 tool_name=tool.name,
                 input_data=arguments,
                 output_data=result,
@@ -101,6 +164,23 @@ class ToolRegistry:
         if tool.requires_approval:
             return True
         return tool.risk_level in {"DESTRUCTIVE", "HIGH_RISK_WRITE"}
+
+    def _validate_output_schema(self, tool: AgentTool, result: dict[str, Any]) -> str | None:
+        if not tool.output_schema:
+            return None
+        required = tool.output_schema.get("required", [])
+        missing = [key for key in required if key not in result]
+        if missing:
+            return f"missing required output keys: {', '.join(missing)}"
+        return None
+
+    def _idempotency_key(self, tool: AgentTool, arguments: dict[str, Any]) -> str | None:
+        if not tool.idempotency_key_strategy:
+            return None
+        if tool.idempotency_key_strategy == "arguments_hash":
+            payload = dumps({"tool": tool.name, "arguments": arguments})
+            return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return f"{tool.name}:{tool.idempotency_key_strategy}"
 
     async def _create_approval_gate(self, tool: AgentTool, arguments: dict[str, Any], agent_name: str) -> dict[str, Any]:
         approval = ApprovalTask(

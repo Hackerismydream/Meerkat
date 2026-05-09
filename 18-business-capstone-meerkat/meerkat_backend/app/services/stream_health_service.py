@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import AlertSeverity, AlertType, LiveSessionStatus
-from app.db.base import LiveSession, StreamHealthSample, StreamIncident, StreamProbeRun
+from app.db.base import LiveSession, StreamHealthSample, StreamIncident, StreamProbeRun, utcnow
 from app.schemas import StreamHealthSampleInput
 from app.services.agent_task_service import create_agent_task, run_agent_task
 from app.services.serialization import dumps, model_to_dict
@@ -65,12 +65,39 @@ async def simulate_stream_health(
             width=sample.width,
             height=sample.height,
             last_segment_age_ms=sample.last_segment_age_ms,
+            last_segment_uri=getattr(sample, "last_segment_uri", None),
+            playlist_hash=getattr(sample, "playlist_hash", None),
             probe_status=sample.probe_status,
             probe_error=sample.probe_error,
         )
         db.add(health)
         persisted.append(health)
     await db.flush()
+
+    if scenario == "stream_recover":
+        incident = await db.scalar(
+            select(StreamIncident)
+            .where(
+                StreamIncident.session_id == session_id,
+                StreamIncident.status.in_(["OPEN", "RECOVERING"]),
+            )
+            .order_by(StreamIncident.id.desc())
+            .limit(1)
+        )
+        if incident is not None:
+            incident.status = "RECOVERED"
+            incident.recovered_at = utcnow()
+            incident.resolved_at = utcnow()
+            incident.last_seen_at = utcnow()
+            incident.recovery_count = sum(1 for sample in persisted if sample.probe_status in {"OK", "RECOVERED"} and sample.audio_present and sample.video_present)
+            await db.commit()
+            return {
+                "incident_created": False,
+                "incident_recovered": True,
+                "samples_created": len(persisted),
+                "stream_incident": model_to_dict(incident),
+                "trace_id": incident.trace_id,
+            }
 
     incident_type = classify_stream_incident(persisted, live_session.status)
     if incident_type is None:
@@ -82,6 +109,11 @@ async def simulate_stream_health(
         incident_type=incident_type,
         severity=AlertSeverity.P1.value,
         status="OPEN",
+        opened_at=utcnow(),
+        last_seen_at=utcnow(),
+        dedupe_key=f"stream:{session_id}:{incident_type}",
+        failure_count=sum(1 for sample in persisted if sample.probe_status == "FAILED"),
+        recovery_count=sum(1 for sample in persisted if sample.probe_status in {"OK", "RECOVERED"}),
         evidence_json=dumps({"scenario": scenario, "sample_ids": [sample.id for sample in persisted]}),
         created_by="SYSTEM",
     )

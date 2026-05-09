@@ -33,6 +33,8 @@ async def run_stream_probe_once(
         video_present=video_present,
         audio_present=audio_present,
         last_segment_age_ms=hls.get("last_segment_age_ms"),
+        last_segment_uri=hls.get("last_segment_uri"),
+        playlist_hash=hls.get("playlist_hash"),
         probe_status="FAILED" if failed else "OK",
         probe_error=error,
     )

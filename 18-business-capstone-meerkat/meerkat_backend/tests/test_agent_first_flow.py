@@ -169,9 +169,31 @@ async def test_owncast_system_message_failure_is_not_logged_as_sent(monkeypatch)
 
     result = await owncast_tools.send_owncast_system_message("hello", dry_run=False)
 
-    assert result["dry_run"] is True
+    assert result["dry_run"] is False
+    assert result["status"] == "FAILED"
     assert result["status_code"] == 401
     assert "Owncast returned 401" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_owncast_system_message_transport_error_returns_failed(monkeypatch):
+    class Client:
+        async def __aenter__(self):
+            raise owncast_tools.httpx.ConnectError("connect failed")
+
+        async def __aexit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(owncast_tools.settings, "owncast_dry_run", False)
+    monkeypatch.setattr(owncast_tools.settings, "auto_send_owncast", True)
+    monkeypatch.setattr(owncast_tools.settings, "owncast_access_token", "token")
+    monkeypatch.setattr(owncast_tools.httpx, "AsyncClient", lambda **_kwargs: Client())
+
+    result = await owncast_tools.send_owncast_system_message("hello", dry_run=False)
+
+    assert result["dry_run"] is False
+    assert result["status"] == "FAILED"
+    assert "connect failed" in result["error"]
 
 
 @pytest.mark.asyncio

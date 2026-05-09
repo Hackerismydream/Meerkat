@@ -60,6 +60,11 @@ async def run_case(client: AsyncClient, case: dict) -> dict:
     payload = response.json()
     trace_id = payload["trace_id"]
     logs = (await client.get("/api/v1/agent-action-logs", params={"trace_id": trace_id})).json()["items"] if trace_id else []
+    if case.get("expected_alert_type", "").startswith("MIXED_"):
+        runs = (await client.get("/api/v1/agent-runs")).json()["items"]
+        logs = []
+        for run in runs:
+            logs.extend((await client.get("/api/v1/agent-action-logs", params={"trace_id": run["trace_id"]})).json()["items"])
     alerts = (await client.get("/api/v1/ops-alerts", params={"session_id": case["session_id"], "status": "OPEN"})).json()["items"]
     approvals = (await client.get("/api/v1/approval-tasks", params={"status": "PENDING"})).json()["items"]
     notes = (await client.get("/api/v1/speaker-notes", params={"session_id": case["session_id"]})).json()["items"]

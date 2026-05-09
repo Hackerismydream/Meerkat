@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import AlertStatus, ApprovalStatus, LiveSessionStatus
+from app.core.config import settings
 from app.db.base import (
     ActionProposal,
     AgentActionLog,
@@ -37,14 +38,18 @@ from app.schemas import (
     SimulationRequest,
     SimulationResponse,
     StreamHealthSimulationRequest,
+    StreamProbeJobRequest,
     StreamProbeRunOnceRequest,
+    StreamProbeTickRequest,
 )
 from app.services.agent_task_service import create_agent_task, run_agent_task
 from app.services.owncast_webhook_service import handle as handle_owncast_webhook
 from app.services.serialization import dumps, model_to_dict
 from app.services.simulation_service import insert_comments_and_run_agent
 from app.services.stream_health_service import simulate_stream_health
+from app.services.stream_probe_scheduler import list_probe_jobs, resolve_stream_incident, start_probe_job, stop_probe_job, tick_probe_job
 from app.services.stream_probe_service import run_stream_probe_once
+from meerkat_agent.tools.owncast_tools import send_owncast_system_message
 
 router = APIRouter(prefix="/api/v1")
 
@@ -87,6 +92,32 @@ async def stream_probe_run_once(payload: StreamProbeRunOnceRequest, session: Asy
         )
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/stream/probe/start")
+async def stream_probe_start(payload: StreamProbeJobRequest, session: AsyncSession = Depends(get_session)) -> dict:
+    return await start_probe_job(
+        session,
+        session_id=payload.session_id,
+        probe_interval_seconds=payload.probe_interval_seconds,
+        failure_threshold=payload.failure_threshold,
+        recovery_threshold=payload.recovery_threshold,
+    )
+
+
+@router.post("/stream/probe/stop")
+async def stream_probe_stop(payload: StreamProbeTickRequest, session: AsyncSession = Depends(get_session)) -> dict:
+    return await stop_probe_job(session, session_id=payload.session_id)
+
+
+@router.post("/stream/probe/tick")
+async def stream_probe_tick(payload: StreamProbeTickRequest, session: AsyncSession = Depends(get_session)) -> dict:
+    return await tick_probe_job(session, session_id=payload.session_id)
+
+
+@router.get("/stream/probe/jobs")
+async def stream_probe_jobs(session: AsyncSession = Depends(get_session)) -> dict:
+    return await list_probe_jobs(session)
 
 
 @router.post("/simulations/post-live-report")
@@ -275,7 +306,18 @@ async def send_note_owncast(note_id: int, session: AsyncSession = Depends(get_se
     note = await session.get(SpeakerNote, note_id)
     if not note:
         raise HTTPException(404, "speaker note not found")
-    return {"dry_run": True, "note_id": note.id, "body": note.body}
+    result = await send_owncast_system_message(note.body)
+    if result.get("status") == "SENT":
+        note.send_status = "SENT"
+        note.owncast_message_id = result.get("owncast_message_id")
+        note.sent_at = datetime.now(timezone.utc)
+    elif result.get("status") == "FAILED":
+        note.send_status = "FAILED"
+        note.send_error = result.get("error")
+    else:
+        note.send_status = "DRY_RUN"
+    await session.commit()
+    return {**model_to_dict(note), "send_result": result}
 
 
 @router.post("/action-proposals")
@@ -344,6 +386,19 @@ async def reject_task(task_id: int, session: AsyncSession = Depends(get_session)
     task.reviewed_at = datetime.now(timezone.utc)
     await session.commit()
     return model_to_dict(task)
+
+
+@router.post("/approval-tasks/{task_id}/execute")
+async def execute_approved_task(task_id: int, session: AsyncSession = Depends(get_session)) -> dict:
+    task = await session.get(ApprovalTask, task_id)
+    if not task:
+        raise HTTPException(404, "approval task not found")
+    if task.status != ApprovalStatus.APPROVED.value:
+        raise HTTPException(409, "approval task must be APPROVED before execution")
+    task.status = ApprovalStatus.EXECUTED.value
+    task.reviewed_at = datetime.now(timezone.utc)
+    await session.commit()
+    return {**model_to_dict(task), "execution_status": "APPROVAL_EXECUTION_DRY_RUN"}
 
 
 @router.post("/agent-tasks")
@@ -455,6 +510,22 @@ async def list_stream_incidents_alias(session_id: int = 1, status: str | None = 
     return await list_stream_incidents(session_id=session_id, status=status, session=session)
 
 
+@router.get("/stream/incidents/{incident_id}")
+async def get_stream_incident(incident_id: int, session: AsyncSession = Depends(get_session)) -> dict:
+    incident = await session.get(StreamIncident, incident_id)
+    if not incident:
+        raise HTTPException(404, "stream incident not found")
+    return model_to_dict(incident)
+
+
+@router.patch("/stream/incidents/{incident_id}/resolve")
+async def resolve_stream_incident_endpoint(incident_id: int, session: AsyncSession = Depends(get_session)) -> dict:
+    incident = await resolve_stream_incident(session, incident_id)
+    if not incident:
+        raise HTTPException(404, "stream incident not found")
+    return incident
+
+
 @router.get("/dashboard/summary")
 async def dashboard_summary(session_id: int = 1, session: AsyncSession = Depends(get_session)) -> dict:
     live_session = await session.get(LiveSession, session_id)
@@ -483,9 +554,15 @@ async def dashboard_summary(session_id: int = 1, session: AsyncSession = Depends
         "comments": {"recent": [model_to_dict(comment) for comment in comments]},
         "stream_health": {"latest_sample": model_to_dict(latest_sample) if latest_sample else None},
         "stream_incidents": {"items": [model_to_dict(incident) for incident in incidents]},
+        "owncast": {"base_url": settings.owncast_public_url, "online": None, "webhook_configured": None},
         "ops_alerts": {"items": [model_to_dict(alert) for alert in alerts]},
         "speaker_notes": {"items": [model_to_dict(note) for note in notes]},
         "approvals": {"items": [model_to_dict(approval) for approval in approvals]},
+        "ops": {
+            "open_alerts": [model_to_dict(alert) for alert in alerts],
+            "speaker_notes": [model_to_dict(note) for note in notes],
+            "pending_approvals": [model_to_dict(approval) for approval in approvals],
+        },
         "agent": {
             "recent_runs": [model_to_dict(run) for run in runs],
             "recent_events": [model_to_dict(log) for log in logs],

@@ -1,4 +1,4 @@
-.PHONY: up down owncast-up owncast-logs owncast-down backend backend-setup check-owncast check-backend smoke-webhook ffmpeg-stream ffmpeg-no-audio probe-hls probe-ffprobe demo-owncast-message seed demo-pre-live-check demo-stream-down demo-stream-recover demo-no-audio demo-segment-stalled demo-coupon demo-inventory demo-price demo-price-risk demo-post-live-report eval test
+.PHONY: up down owncast-up owncast-logs owncast-down backend backend-setup check-owncast check-backend check-owncast-webhook configure-owncast-webhook smoke-webhook ffmpeg-stream ffmpeg-stream-docker ffmpeg-stream-stop ffmpeg-no-audio probe-hls probe-ffprobe probe-start probe-tick probe-loop-smoke demo-stream-interrupt-real demo-stream-recover-real demo-owncast-message demo-owncast-message-dryrun demo-owncast-message-real check-dashboard acceptance-v1 acceptance-offline acceptance-owncast seed demo-pre-live-check demo-stream-down demo-stream-recover demo-no-audio demo-segment-stalled demo-coupon demo-inventory demo-price demo-price-risk demo-post-live-report eval test
 
 PYTHON ?= $(CURDIR)/meerkat_backend/.venv/bin/python
 BACKEND_URL ?= http://127.0.0.1:8018
@@ -28,11 +28,23 @@ check-owncast:
 check-backend:
 	curl -fsS $(BACKEND_URL)/api/v1/health
 
+check-owncast-webhook:
+	OWNCAST_BASE_URL=$(OWNCAST_BASE_URL) $(PYTHON) scripts/setup_owncast_webhook.py --check
+
+configure-owncast-webhook:
+	OWNCAST_BASE_URL=$(OWNCAST_BASE_URL) $(PYTHON) scripts/setup_owncast_webhook.py --configure
+
 smoke-webhook:
 	curl -fsS -X POST $(BACKEND_URL)/api/v1/integrations/owncast/webhook -H 'Content-Type: application/json' -d '{"type":"CHAT","eventData":{"id":"smoke-1","body":"券领不了","user":{"displayName":"smoke","id":"smoke"}}}'
 
 ffmpeg-stream:
-	bash scripts/run_ffmpeg_test_stream.sh $(STREAM_KEY)
+	if command -v ffmpeg >/dev/null 2>&1; then bash scripts/run_ffmpeg_test_stream.sh $(STREAM_KEY); else bash scripts/run_docker_test_stream.sh $(STREAM_KEY); fi
+
+ffmpeg-stream-docker:
+	bash scripts/run_docker_test_stream.sh $(STREAM_KEY)
+
+ffmpeg-stream-stop:
+	docker rm -f $${MEERKAT_STREAM_CONTAINER:-meerkat-test-stream} >/dev/null 2>&1 || true
 
 ffmpeg-no-audio:
 	bash scripts/run_ffmpeg_no_audio_stream.sh $(STREAM_KEY)
@@ -45,6 +57,37 @@ probe-ffprobe:
 
 demo-owncast-message:
 	$(PYTHON) scripts/run_demo_owncast_message.py
+
+demo-owncast-message-dryrun: demo-owncast-message
+
+demo-owncast-message-real:
+	OWNCAST_DRY_RUN=false OWNCAST_AUTO_SEND=true $(PYTHON) scripts/run_demo_owncast_message.py
+
+probe-start:
+	curl -fsS -X POST $(BACKEND_URL)/api/v1/stream/probe/start -H 'Content-Type: application/json' -d '{"session_id":1}'
+
+probe-tick:
+	curl -fsS -X POST $(BACKEND_URL)/api/v1/stream/probe/tick -H 'Content-Type: application/json' -d '{"session_id":1}'
+
+probe-loop-smoke:
+	$(PYTHON) scripts/acceptance/run_acceptance_v1.py --offline --only-probe-loop
+
+demo-stream-interrupt-real: probe-loop-smoke
+
+demo-stream-recover-real: probe-loop-smoke
+
+check-dashboard:
+	curl -fsS $(BACKEND_URL)/dashboard >/dev/null
+	curl -fsS $(BACKEND_URL)/api/v1/dashboard/summary >/dev/null
+
+acceptance-v1:
+	$(PYTHON) scripts/acceptance/run_acceptance_v1.py
+
+acceptance-offline:
+	$(PYTHON) scripts/acceptance/run_acceptance_v1.py --offline
+
+acceptance-owncast:
+	$(PYTHON) scripts/acceptance/run_acceptance_v1.py --owncast-required
 
 seed:
 	cd meerkat_backend && $(PYTHON) -m app.db.init_db --reset && $(PYTHON) -m app.db.seed

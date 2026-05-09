@@ -27,20 +27,22 @@ Meerkat：基于 OpenClaw Runtime 的直播运营现场指挥 Agent Workflow 平
 来源：`cd meerkat_agent/evals && python run_eval.py`。
 
 ```text
-alert_type_accuracy = 94%
-subagent_dispatch_coverage = 96%
-tool_call_recall = 96%
-tool_call_precision = 96%
+alert_type_accuracy = 100%
+subagent_dispatch_coverage = 100%
+tool_selection_accuracy = 100%
+tool_call_recall = 100%
+tool_call_precision = 100%
 tool_execution_success_rate = 100%
 forbidden_tool_block_rate = 100%
-risk_gate_accuracy = 96%
+risk_gate_accuracy = 100%
 approval_trigger_accuracy = 100%
-policy_grounding_accuracy = 94%
+policy_grounding_accuracy = 100%
+speaker_note_created_rate = 100%
 trace_completeness = 100%
-p95_agent_run_latency = 21 ms
+p95_end_to_end_latency = 35 ms
 ```
 
-当前 eval 覆盖 50 个 case，包含 comment anomaly、stream health、tool safety、workflow 和 false positive。报告中保留失败样例，主要缺口是更自然的库存表达召回和混合异常拆分。
+当前 eval 覆盖 50 个 case，包含 comment anomaly、stream health、tool safety、workflow、false positive 和混合异常拆分；本地最新报告无失败样例。
 
 ## 面试讲解顺序
 

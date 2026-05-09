@@ -12,6 +12,11 @@ from app.db.base import AgentRun, AgentTask
 from app.services.serialization import dumps, loads
 from app.services.trace_service import write_log
 from app.services.post_live_report_service import create_post_live_report
+from meerkat_agent.agents.risk.runner import RiskRunner
+from meerkat_agent.agents.script.runner import ScriptRunner
+from meerkat_agent.agents.stream_monitor.runner import StreamMonitorRunner
+from meerkat_agent.runtime.agent_dispatcher import AgentDispatcher
+from meerkat_agent.runtime.base_agent import AgentExecutionContext
 from meerkat_agent.runtime.schemas import AgentTool
 from meerkat_agent.runtime.tool_registry import ToolRegistry
 from meerkat_agent.tools.meerkat_tools import MeerkatTools
@@ -70,11 +75,53 @@ class MeerkatAgentRunner:
             AgentTool("get_coupon_detail", "READ_ONLY", "Get coupon detail.", tools.get_coupon_detail, input_schema={"required": ["coupon_id"]}),
             AgentTool("get_stream_incident_context", "READ_ONLY", "Get stream incident context.", tools.get_stream_incident_context, input_schema={"required": ["stream_incident_id"]}),
             AgentTool("search_policy_docs", "READ_ONLY", "Search local policy docs.", tools.search_policy_docs, input_schema={"required": ["query"]}),
-            AgentTool("create_ops_alert", "LOW_RISK_WRITE", "Create an operations alert.", tools.create_ops_alert, input_schema={"required": ["session_id", "alert_type", "severity", "title", "summary", "evidence"]}),
-            AgentTool("create_speaker_note", "LOW_RISK_WRITE", "Create a speaker note.", tools.create_speaker_note, input_schema={"required": ["session_id", "body"]}),
-            AgentTool("create_action_proposal", "LOW_RISK_WRITE", "Create an action proposal.", tools.create_action_proposal, input_schema={"required": ["session_id", "action_type", "risk_level", "arguments", "reason"]}),
-            AgentTool("create_approval_task", "LOW_RISK_WRITE", "Create a human approval task.", tools.create_approval_task, input_schema={"required": ["session_id", "title", "reason", "payload"]}),
-            AgentTool("send_owncast_system_message", "MEDIUM_RISK_WRITE", "Send or dry-run an Owncast system chat message.", send_owncast_system_message, input_schema={"required": ["body"]}, allowed_agents=["script", "commander"]),
+            AgentTool(
+                "create_ops_alert",
+                "LOW_RISK_WRITE",
+                "Create an operations alert.",
+                tools.create_ops_alert,
+                input_schema={"required": ["session_id", "alert_type", "severity", "title", "summary", "evidence"]},
+                output_schema={"required": ["id", "status", "alert_type"]},
+                idempotency_key_strategy="arguments_hash",
+            ),
+            AgentTool(
+                "create_speaker_note",
+                "LOW_RISK_WRITE",
+                "Create a speaker note.",
+                tools.create_speaker_note,
+                input_schema={"required": ["session_id", "body"]},
+                output_schema={"required": ["id", "status", "body"]},
+                idempotency_key_strategy="arguments_hash",
+            ),
+            AgentTool(
+                "create_action_proposal",
+                "LOW_RISK_WRITE",
+                "Create an action proposal.",
+                tools.create_action_proposal,
+                input_schema={"required": ["session_id", "action_type", "risk_level", "arguments", "reason"]},
+                output_schema={"required": ["id", "status", "action_type"]},
+                idempotency_key_strategy="arguments_hash",
+            ),
+            AgentTool(
+                "create_approval_task",
+                "LOW_RISK_WRITE",
+                "Create a human approval task.",
+                tools.create_approval_task,
+                input_schema={"required": ["session_id", "title", "reason", "payload"]},
+                output_schema={"required": ["id", "status", "risk_level"]},
+                idempotency_key_strategy="arguments_hash",
+            ),
+            AgentTool(
+                "send_owncast_system_message",
+                "MEDIUM_RISK_WRITE",
+                "Send or dry-run an Owncast system chat message.",
+                send_owncast_system_message,
+                input_schema={"required": ["body"]},
+                output_schema={"required": ["status", "dry_run", "message"]},
+                allowed_agents=["script", "commander"],
+                timeout_ms=5000,
+                idempotency_key_strategy="arguments_hash",
+            ),
             AgentTool("change_coupon_time", "DESTRUCTIVE", "Change coupon activation time.", allowed_agents=["risk"], requires_approval=True, input_schema={"required": ["session_id", "coupon_id", "proposal_id"]}),
             AgentTool("change_product_price", "DESTRUCTIVE", "Change product price.", allowed_agents=["risk"], requires_approval=True, input_schema={"required": ["session_id", "product_id", "proposal_id"]}),
             AgentTool("hide_product_from_live", "HIGH_RISK_WRITE", "Hide a product from live room.", allowed_agents=["risk"], requires_approval=True, input_schema={"required": ["session_id", "product_id"]}),
@@ -213,22 +260,33 @@ class MeerkatAgentRunner:
             return {"trace_id": task.trace_id, "alert_created": False, "reason": "missing stream_incident_id"}
         alert_type = AlertType(task.alert_type_hint or AlertType.STREAM_INTERRUPTED.value)
         await self._dispatch(task, "stream_monitor", {"stream_incident_id": stream_incident_id})
-        context = await registry.call("get_stream_incident_context", {"stream_incident_id": stream_incident_id}, agent_name="stream_monitor")
-        await self._subagent_result(
-            task,
+        dispatcher = AgentDispatcher({"stream_monitor": StreamMonitorRunner(), "risk": RiskRunner(), "script": ScriptRunner()})
+        agent_context = AgentExecutionContext(db=self.db, trace_id=task.trace_id, session_id=task.session_id, registry=registry)
+        stream_result = await dispatcher.run(
             "stream_monitor",
-            {
-                "incident_type": alert_type.value,
-                "confidence": 0.92,
-                "recommended_actions": ["检查 OBS 连接", "暂停商品讲解", "使用备用话术安抚观众"],
-            },
+            {"stream_incident_id": stream_incident_id, "incident_type": alert_type.value},
+            agent_context,
         )
         policies = await self._policy(task, registry, "推流 异常 断流 黑屏 无声 HLS")
         await self._risk(task, "LOW_RISK_WRITE", False, [])
+        risk_result = await dispatcher.run(
+            "risk",
+            {"risk_level": "LOW_RISK_WRITE", "requires_approval": False, "blocked_tools": [], "reason": "Stream response creates internal ops artifacts only."},
+            agent_context,
+        )
+        script_result = await dispatcher.run(
+            "script",
+            {
+                "speaker_note": "当前直播信号出现波动，请场控确认 OBS 和网络状态，主播先暂停关键商品承诺，等待恢复确认。",
+                "target": "field_control",
+                "requires_operator_confirm": False,
+            },
+            agent_context,
+        )
         await self._action_plan(
             task,
             {
-                "recommended_actions": ["创建推流异常告警", "生成场控话术", "持续观察恢复状态"],
+                "recommended_actions": stream_result.output["recommended_actions"],
                 "incident_type": alert_type.value,
             },
         )
@@ -239,8 +297,8 @@ class MeerkatAgentRunner:
                 "alert_type": alert_type.value,
                 "severity": AlertSeverity.P1.value,
                 "title": f"直播推流异常：{alert_type.value}",
-                "summary": "stream_monitor_agent 已根据推流健康样本识别异常，并生成场控处理建议。",
-                "evidence": {"stream_incident_id": stream_incident_id, "context": context, "policies": policies["items"]},
+                "summary": stream_result.output["diagnosis"],
+                "evidence": {"stream_incident_id": stream_incident_id, "stream_monitor": stream_result.output, "risk": risk_result.output, "policies": policies["items"]},
             },
         )
         await write_log(self.db, trace_id=task.trace_id, session_id=task.session_id, agent_name="commander", action_type="ALERT_CREATED", output_data={"alert_id": alert["id"]})
@@ -249,8 +307,8 @@ class MeerkatAgentRunner:
             {
                 "session_id": task.session_id,
                 "alert_id": alert["id"],
-                "body": "当前直播信号出现波动，请场控确认 OBS 和网络状态，主播先暂停关键商品承诺，等待恢复确认。",
-                "target": "field_control",
+                "body": script_result.output["speaker_note"],
+                "target": script_result.output["target"],
             },
             agent_name="script",
         )
