@@ -21,6 +21,8 @@ from app.db.base import (
     OpsAlert,
     Product,
     SpeakerNote,
+    StreamHealthSample,
+    StreamIncident,
     SkuInventory,
 )
 from app.db.session import get_session
@@ -31,13 +33,16 @@ from app.schemas import (
     CreateLiveSessionRequest,
     CreateOpsAlertRequest,
     CreateSpeakerNoteRequest,
+    PostLiveReportRequest,
     SimulationRequest,
     SimulationResponse,
+    StreamHealthSimulationRequest,
 )
 from app.services.agent_task_service import create_agent_task, run_agent_task
 from app.services.owncast_webhook_service import handle as handle_owncast_webhook
 from app.services.serialization import dumps, model_to_dict
 from app.services.simulation_service import insert_comments_and_run_agent
+from app.services.stream_health_service import simulate_stream_health
 
 router = APIRouter(prefix="/api/v1")
 
@@ -59,6 +64,38 @@ async def simulate_comments(payload: SimulationRequest, session: AsyncSession = 
     result = await insert_comments_and_run_agent(session, session_id=payload.session_id, comments=payload.comments)
     await session.commit()
     return result
+
+
+@router.post("/simulations/stream-health")
+async def simulate_stream_health_endpoint(payload: StreamHealthSimulationRequest, session: AsyncSession = Depends(get_session)) -> dict:
+    try:
+        return await simulate_stream_health(session, session_id=payload.session_id, scenario=payload.scenario, samples=payload.samples)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/simulations/post-live-report")
+async def simulate_post_live_report(payload: PostLiveReportRequest, session: AsyncSession = Depends(get_session)) -> dict:
+    task = await create_agent_task(
+        session,
+        session_id=payload.session_id,
+        source="SIMULATION",
+        task_type="POST_LIVE_REPORT",
+        input_payload={"report_scope": "post_live"},
+    )
+    return await run_agent_task(session, task.id)
+
+
+@router.post("/simulations/pre-live-check")
+async def simulate_pre_live_check(payload: PostLiveReportRequest, session: AsyncSession = Depends(get_session)) -> dict:
+    task = await create_agent_task(
+        session,
+        session_id=payload.session_id,
+        source="SIMULATION",
+        task_type="PRE_LIVE_CHECK",
+        input_payload={"check_scope": "pre_live"},
+    )
+    return await run_agent_task(session, task.id)
 
 
 @router.get("/live-sessions/{session_id}")
@@ -343,6 +380,47 @@ async def recent_agent_logs(limit: int = Query(default=100, le=500), session: As
     return {"items": [model_to_dict(log) for log in logs]}
 
 
+@router.get("/traces/{trace_id}")
+async def replay_trace(trace_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    logs = list((await session.scalars(select(AgentActionLog).where(AgentActionLog.trace_id == trace_id).order_by(AgentActionLog.id.asc()))).all())
+    if not logs:
+        raise HTTPException(404, "trace not found")
+    runs = list((await session.scalars(select(AgentRun).where(AgentRun.trace_id == trace_id).order_by(AgentRun.id.asc()))).all())
+    timeline = [model_to_dict(log) for log in logs]
+    agents: dict[str, dict] = {}
+    for event in timeline:
+        agent_name = event["agent_name"]
+        agents.setdefault(agent_name, {"agent_name": agent_name, "events": [], "tool_calls": []})
+        agents[agent_name]["events"].append(event)
+        if event["action_type"] == "TOOL_CALL":
+            agents[agent_name]["tool_calls"].append(event["tool_name"])
+    return {
+        "trace_id": trace_id,
+        "runs": [model_to_dict(run) for run in runs],
+        "timeline": timeline,
+        "agents": list(agents.values()),
+        "workflow_tree": {
+            "root": runs[0].root_agent if runs else timeline[0]["agent_name"],
+            "children": sorted({(event.get("output") or {}).get("to") for event in timeline if event["action_type"] == "SUBAGENT_DISPATCH" and (event.get("output") or {}).get("to")}),
+        },
+    }
+
+
+@router.get("/stream-health/samples")
+async def list_stream_health_samples(session_id: int = 1, session: AsyncSession = Depends(get_session)) -> dict:
+    samples = list((await session.scalars(select(StreamHealthSample).where(StreamHealthSample.session_id == session_id).order_by(StreamHealthSample.id.desc()).limit(50))).all())
+    return {"items": [model_to_dict(sample) for sample in samples]}
+
+
+@router.get("/stream-incidents")
+async def list_stream_incidents(session_id: int = 1, status: str | None = None, session: AsyncSession = Depends(get_session)) -> dict:
+    query = select(StreamIncident).where(StreamIncident.session_id == session_id).order_by(StreamIncident.id.desc())
+    if status:
+        query = query.where(StreamIncident.status == status)
+    incidents = list((await session.scalars(query)).all())
+    return {"items": [model_to_dict(incident) for incident in incidents]}
+
+
 dashboard_router = APIRouter()
 
 
@@ -363,25 +441,31 @@ async def dashboard() -> str:
 </head>
 <body>
   <h1>Meerkat Console</h1>
-  <p>直播评论、运营告警、主播话术和审批任务。</p>
+  <p>直播状态、推流健康、评论异常、Agent trace、话术和审批任务。</p>
   <main>
     <section><h2>Recent Comments</h2><pre id="comments"></pre></section>
+    <section><h2>Stream Incidents</h2><pre id="incidents"></pre></section>
     <section><h2>Open Alerts</h2><pre id="alerts"></pre></section>
     <section><h2>Speaker Notes</h2><pre id="notes"></pre></section>
     <section><h2>Pending Approvals</h2><pre id="approvals"></pre></section>
+    <section><h2>Agent Timeline</h2><pre id="trace"></pre></section>
   </main>
   <script>
     async function load() {
-      const [comments, alerts, notes, approvals] = await Promise.all([
+      const [comments, incidents, alerts, notes, approvals, trace] = await Promise.all([
         fetch('/api/v1/comments/recent?session_id=1&limit=50').then(r => r.json()),
+        fetch('/api/v1/stream-incidents?session_id=1').then(r => r.json()),
         fetch('/api/v1/ops-alerts?session_id=1&status=OPEN').then(r => r.json()),
         fetch('/api/v1/speaker-notes?session_id=1').then(r => r.json()),
-        fetch('/api/v1/approval-tasks?status=PENDING').then(r => r.json())
+        fetch('/api/v1/approval-tasks?status=PENDING').then(r => r.json()),
+        fetch('/api/v1/agent-action-logs/recent?limit=80').then(r => r.json())
       ]);
       document.getElementById('comments').textContent = JSON.stringify(comments.items, null, 2);
+      document.getElementById('incidents').textContent = JSON.stringify(incidents.items, null, 2);
       document.getElementById('alerts').textContent = JSON.stringify(alerts.items, null, 2);
       document.getElementById('notes').textContent = JSON.stringify(notes.items, null, 2);
       document.getElementById('approvals').textContent = JSON.stringify(approvals.items, null, 2);
+      document.getElementById('trace').textContent = JSON.stringify(trace.items, null, 2);
     }
     load(); setInterval(load, 3000);
   </script>

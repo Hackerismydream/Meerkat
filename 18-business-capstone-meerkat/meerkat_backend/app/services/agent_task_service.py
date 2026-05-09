@@ -29,15 +29,18 @@ async def create_agent_task(
     *,
     session_id: int,
     source: str,
-    alert_type_hint: AlertType | str | None,
-    comment_ids: list[int],
-    input_payload: dict[str, Any],
+    alert_type_hint: AlertType | str | None = None,
+    comment_ids: list[int] | None = None,
+    input_payload: dict[str, Any] | None = None,
+    task_type: str = "COMMENT_WINDOW_ANALYSIS",
 ) -> AgentTask:
     hint = alert_type_hint.value if isinstance(alert_type_hint, AlertType) else alert_type_hint
+    comment_ids = comment_ids or []
+    input_payload = input_payload or {}
     task = AgentTask(
         trace_id=new_trace_id(),
         session_id=session_id,
-        task_type="COMMENT_WINDOW_ANALYSIS",
+        task_type=task_type,
         source=source,
         alert_type_hint=hint,
         comment_ids_json=dumps(comment_ids),

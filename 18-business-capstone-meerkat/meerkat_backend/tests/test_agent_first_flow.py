@@ -5,7 +5,18 @@ from app.db.init_db import reset_database
 from app.db.seed import seed_database
 from app.main import app
 from app.db.session import SessionLocal
-from app.db.base import LiveComment, OwncastEvent
+from app.db.base import (
+    CommentCluster,
+    LiveComment,
+    LiveRoom,
+    LiveScript,
+    OwncastEvent,
+    PostLiveReport,
+    Product,
+    ProductAlias,
+    StreamHealthSample,
+    StreamIncident,
+)
 from sqlalchemy import select
 
 
@@ -194,3 +205,118 @@ async def test_owncast_chat_webhook_links_comment_to_raw_event_and_runs_agent():
     assert all(event.processed for event in events)
     assert [comment.owncast_event_id for comment in comments] == [event.id for event in events]
     assert [comment.external_message_id for comment in comments] == ["msg-1", "msg-2", "msg-3"]
+
+
+@pytest.mark.asyncio
+async def test_seed_data_matches_final_product_plan_domain_surface():
+    async with SessionLocal() as session:
+        live_rooms = list((await session.scalars(select(LiveRoom))).all())
+        products = list((await session.scalars(select(Product))).all())
+        aliases = list((await session.scalars(select(ProductAlias))).all())
+        scripts = list((await session.scalars(select(LiveScript))).all())
+
+    assert len(live_rooms) == 1
+    assert len(products) >= 8
+    assert len(aliases) >= 10
+    assert len(scripts) >= 2
+
+
+@pytest.mark.asyncio
+async def test_stream_down_simulation_creates_incident_alert_note_and_trace_replay():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/simulations/stream-health",
+            json={
+                "session_id": 1,
+                "scenario": "stream_down",
+                "samples": [
+                    {"is_live": False, "probe_status": "FAILED", "probe_error": "HLS playlist unavailable"},
+                    {"is_live": False, "probe_status": "FAILED", "probe_error": "HLS playlist unavailable"},
+                    {"is_live": False, "probe_status": "FAILED", "probe_error": "HLS playlist unavailable"},
+                ],
+            },
+        )
+        payload = response.json()
+        replay = (await client.get(f"/api/v1/traces/{payload['trace_id']}")).json()
+
+    assert response.status_code == 200
+    assert payload["incident_type"] == "STREAM_INTERRUPTED"
+    assert payload["created_entities"]["stream_incident_id"]
+    assert payload["created_entities"]["ops_alert_id"]
+    assert payload["created_entities"]["speaker_note_id"]
+    assert payload["trace_id"]
+    assert [event["action_type"] for event in replay["timeline"]]
+    assert "stream_monitor" in {event["agent_name"] for event in replay["timeline"]}
+
+    async with SessionLocal() as session:
+        samples = list((await session.scalars(select(StreamHealthSample))).all())
+        incidents = list((await session.scalars(select(StreamIncident))).all())
+
+    assert len(samples) == 3
+    assert len(incidents) == 1
+
+
+@pytest.mark.asyncio
+async def test_owncast_stream_stopped_webhook_triggers_stream_monitor_agent():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/integrations/owncast/webhook",
+            json={"type": "STREAM_STOPPED", "eventData": {"streamTitle": "618 爆款家电直播"}},
+        )
+        payload = response.json()
+        replay = (await client.get(f"/api/v1/traces/{payload['trace_id']}")).json()
+
+    assert response.status_code == 200
+    assert payload["incident_type"] == "STREAM_INTERRUPTED"
+    assert payload["created_entities"]["stream_incident_id"]
+    assert "stream_monitor" in {event["agent_name"] for event in replay["timeline"]}
+
+
+@pytest.mark.asyncio
+async def test_single_noise_comment_does_not_create_cluster_or_agent_run():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/simulations/comments",
+            json={"session_id": 1, "comments": [{"user_name": "u1", "body": "主播今天状态不错"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["agent_runs_triggered"] == 0
+
+    async with SessionLocal() as session:
+        clusters = list((await session.scalars(select(CommentCluster))).all())
+
+    assert clusters == []
+
+
+@pytest.mark.asyncio
+async def test_post_live_report_persists_markdown_and_memory_updates():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post(
+            "/api/v1/simulations/comments",
+            json={
+                "session_id": 1,
+                "comments": [
+                    {"user_name": "u1", "body": "主播说 99 页面怎么是 129"},
+                    {"user_name": "u2", "body": "价格不对啊"},
+                    {"user_name": "u3", "body": "这不是虚假宣传吗"},
+                ],
+            },
+        )
+        response = await client.post("/api/v1/simulations/post-live-report", json={"session_id": 1})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["report_id"]
+    assert "价格口径" in payload["summary_markdown"]
+    assert payload["memory_updates"]
+    assert payload["run_id"]
+
+    async with SessionLocal() as session:
+        reports = list((await session.scalars(select(PostLiveReport))).all())
+
+    assert len(reports) == 1

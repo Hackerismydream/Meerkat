@@ -42,14 +42,24 @@ async def run_case(client: AsyncClient, case: dict) -> dict:
     await reset_database()
     await seed_database()
     started = time.perf_counter()
-    response = await client.post(
-        "/api/v1/simulations/comments",
-        json={"session_id": case["session_id"], "comments": [{"user_name": case["id"], "body": body} for body in case["comments"]]},
-    )
+    if case.get("kind") == "stream_health":
+        response = await client.post(
+            "/api/v1/simulations/stream-health",
+            json={
+                "session_id": case["session_id"],
+                "scenario": case["scenario"],
+                "samples": case.get("samples", []),
+            },
+        )
+    else:
+        response = await client.post(
+            "/api/v1/simulations/comments",
+            json={"session_id": case["session_id"], "comments": [{"user_name": case["id"], "body": body} for body in case["comments"]]},
+        )
     latency_ms = int((time.perf_counter() - started) * 1000)
     payload = response.json()
     trace_id = payload["trace_id"]
-    logs = (await client.get("/api/v1/agent-action-logs", params={"trace_id": trace_id})).json()["items"]
+    logs = (await client.get("/api/v1/agent-action-logs", params={"trace_id": trace_id})).json()["items"] if trace_id else []
     alerts = (await client.get("/api/v1/ops-alerts", params={"session_id": case["session_id"], "status": "OPEN"})).json()["items"]
     approvals = (await client.get("/api/v1/approval-tasks", params={"status": "PENDING"})).json()["items"]
     notes = (await client.get("/api/v1/speaker-notes", params={"session_id": case["session_id"]})).json()["items"]
@@ -74,7 +84,7 @@ async def run_case(client: AsyncClient, case: dict) -> dict:
             "risk_gate_accuracy": grade_risk_gate_accuracy(case, logs),
             "approval_trigger_accuracy": grade_approval_trigger(case, approvals),
             "policy_grounding_accuracy": grade_policy_grounding(case, logs),
-            "speaker_note_created_rate": 1.0 if notes else 0.0,
+            "speaker_note_created_rate": 1.0 if (not notes if case.get("expected_no_alert") else notes) else 0.0,
             "trace_completeness": grade_trace_completeness(logs),
         },
     }
@@ -94,6 +104,18 @@ async def main() -> None:
     lines = ["# Meerkat Eval Report", "", "| metric | value |", "|---|---:|"]
     for key, value in metrics.items():
         lines.append(f"| {key} | {value:.2f} |")
+    failed = [
+        result
+        for result in results
+        if any(score < 1.0 for score in result["scores"].values())
+    ]
+    lines.extend(["", "## Failed Cases", ""])
+    if failed:
+        for result in failed:
+            bad_scores = {key: value for key, value in result["scores"].items() if value < 1.0}
+            lines.append(f"- {result['case']['id']}: scores={bad_scores}, trace={result['trace_id']}")
+    else:
+        lines.append("- None")
     lines.extend(["", "## Cases", ""])
     for result in results:
         lines.append(f"- {result['case']['id']}: trace={result['trace_id']}, tools={','.join(result['tools'])}")

@@ -19,12 +19,27 @@ class LiveSession(Base):
     __tablename__ = "live_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    live_room_id: Mapped[int | None] = mapped_column(ForeignKey("live_rooms.id"), nullable=True)
     title: Mapped[str] = mapped_column(String(200))
     owncast_stream_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     status: Mapped[str] = mapped_column(String(50))
+    current_product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True)
     scheduled_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class LiveRoom(Base):
+    __tablename__ = "live_rooms"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    owncast_base_url: Mapped[str] = mapped_column(String(500))
+    owncast_stream_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="ACTIVE")
+    owner_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -56,6 +71,16 @@ class LiveSessionProduct(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class ProductAlias(Base):
+    __tablename__ = "product_aliases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    session_id: Mapped[int | None] = mapped_column(ForeignKey("live_sessions.id"), nullable=True)
+    alias: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class SkuInventory(Base):
     __tablename__ = "sku_inventory"
 
@@ -84,6 +109,21 @@ class Coupon(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class LiveScript(Base):
+    __tablename__ = "live_scripts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("live_sessions.id"))
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    sequence_no: Mapped[int] = mapped_column(Integer)
+    spoken_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    spoken_coupon_text: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    selling_points: Mapped[str | None] = mapped_column(Text, nullable=True)
+    risk_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class OwncastEvent(Base):
     __tablename__ = "owncast_events"
 
@@ -108,6 +148,71 @@ class LiveComment(Base):
     normalized_body: Mapped[str] = mapped_column(Text)
     matched_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CommentCluster(Base):
+    __tablename__ = "comment_clusters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("live_sessions.id"))
+    alert_type: Mapped[str] = mapped_column(String(50))
+    status: Mapped[str] = mapped_column(String(50))
+    confidence: Mapped[Decimal] = mapped_column(Numeric(4, 2))
+    evidence_comment_ids_json: Mapped[str] = mapped_column(Text)
+    target_product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True)
+    target_coupon_id: Mapped[int | None] = mapped_column(ForeignKey("coupons.id"), nullable=True)
+    summary: Mapped[str] = mapped_column(Text)
+    trace_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class StreamProbeRun(Base):
+    __tablename__ = "stream_probe_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("live_sessions.id"))
+    probe_type: Mapped[str] = mapped_column(String(50))
+    status: Mapped[str] = mapped_column(String(50))
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class StreamHealthSample(Base):
+    __tablename__ = "stream_health_samples"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("live_sessions.id"))
+    probe_run_id: Mapped[int | None] = mapped_column(ForeignKey("stream_probe_runs.id"), nullable=True)
+    is_live: Mapped[bool] = mapped_column(Boolean, default=False)
+    video_present: Mapped[bool] = mapped_column(Boolean, default=True)
+    audio_present: Mapped[bool] = mapped_column(Boolean, default=True)
+    bitrate_kbps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fps: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_segment_age_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    probe_status: Mapped[str] = mapped_column(String(50))
+    probe_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sampled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StreamIncident(Base):
+    __tablename__ = "stream_incidents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("live_sessions.id"))
+    incident_type: Mapped[str] = mapped_column(String(50))
+    severity: Mapped[str] = mapped_column(String(10))
+    status: Mapped[str] = mapped_column(String(50))
+    evidence_json: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(50))
+    trace_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class OpsAlert(Base):
@@ -227,4 +332,19 @@ class AgentActionLog(Base):
     status: Mapped[str] = mapped_column(String(50))
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PostLiveReport(Base):
+    __tablename__ = "post_live_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("live_sessions.id"))
+    title: Mapped[str] = mapped_column(String(300))
+    summary_markdown: Mapped[str] = mapped_column(Text)
+    metrics_json: Mapped[str] = mapped_column(Text)
+    recommendations_json: Mapped[str] = mapped_column(Text)
+    memory_updates_json: Mapped[str] = mapped_column(Text)
+    created_by_agent_run_id: Mapped[int | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

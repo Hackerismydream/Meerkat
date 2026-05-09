@@ -1,4 +1,5 @@
 import asyncio
+import sys
 
 from app.db.base import Base
 from app.db.session import engine
@@ -16,7 +17,10 @@ async def reset_database() -> None:
 
 
 def main() -> None:
-    asyncio.run(init_database())
+    if "--reset" in sys.argv:
+        asyncio.run(reset_database())
+    else:
+        asyncio.run(init_database())
 
 
 if __name__ == "__main__":

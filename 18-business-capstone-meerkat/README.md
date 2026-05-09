@@ -1,22 +1,22 @@
 # Step 18: Meerkat
 
-> Meerkat：狐獴哨兵，直播间运营异常处理多智能体系统。
+> Meerkat：狐獴哨兵，直播运营现场指挥多智能体系统。
 
-Meerkat 不是从零实现直播系统，而是接入开源直播服务 Owncast，把直播评论流转成 Agent 可处理的业务事件；随后使用 Python/FastAPI 实现 Meerkat Backend，并基于 OpenClaw Runtime 的事件驱动、工具调用、多智能体 dispatch、风险控制和 trace 思路构建 Meerkat Agent。
+Meerkat 不是从零实现直播系统，而是接入开源直播服务 Owncast，把直播评论流和推流健康样本转成 Agent 可处理的业务事件；随后使用 Python/FastAPI 实现 Meerkat Backend，并基于 OpenClaw Runtime 的事件驱动、工具调用、多智能体 dispatch、风险控制和 trace 思路构建 Meerkat Agent。
 
-学习者最终得到的不是一个聊天机器人，而是一个能写进简历的 Agent 工程项目：Agent 监听实时评论、查询商品/库存/优惠券、检索运营 SOP、生成主播话术、创建运营告警、发起人工审批，并记录 trace 和 eval 指标。
+学习者最终得到的不是一个聊天机器人，而是一个能写进简历的 Agent 工程项目：Agent 监听实时评论、主动识别推流异常、查询商品/库存/优惠券、检索运营 SOP、生成主播/场控话术、创建运营告警、发起人工审批、生成下播复盘，并记录 trace 和 eval 指标。
 
 ## Architecture
 
 ```text
-Owncast CHAT / simulated comments
+Owncast CHAT / stream probe / simulated comments
   -> Meerkat Backend saves comments
-  -> deterministic classifier creates candidate anomaly
+  -> deterministic classifier / stream detector creates candidate anomaly
   -> AgentTask
   -> commander agent
-  -> live_triage / product / coupon / policy / risk / script agents
+  -> stream_monitor / live_triage / product / coupon / policy / risk / script / report agents
   -> ToolRegistry
-  -> ops_alerts / speaker_notes / approval_tasks / agent_action_logs
+  -> stream_incidents / ops_alerts / speaker_notes / approval_tasks / post_live_reports / agent_action_logs
 ```
 
 Backend 只负责业务数据、事件接入、工具 API 和状态持久化。告警、话术、审批必须由 Meerkat Agent 通过 tools 创建，`anomaly_detector` 只创建候选异常和 AgentTask。
@@ -36,7 +36,7 @@ cd meerkat_backend
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-python -m app.db.init_db
+python -m app.db.init_db --reset
 python -m app.db.seed
 uvicorn app.main:app --host 0.0.0.0 --port 8018 --reload
 ```
@@ -69,9 +69,12 @@ The webhook parser tolerates missing fields and accepts the common Owncast shape
 python scripts/run_demo_coupon.py
 python scripts/run_demo_inventory.py
 python scripts/run_demo_price.py
+python scripts/run_demo_stream_down.py
+python scripts/run_demo_no_audio.py
+python scripts/run_demo_post_live_report.py
 ```
 
-Each demo resets and seeds the local SQLite database, injects comments through `/api/v1/simulations/comments`, runs the Agent workflow, then prints the trace id, created entities, and tool calls.
+Each demo resets and seeds the local SQLite database, injects comments or stream samples through simulation APIs, runs the Agent workflow, then prints the trace id, created entities, tool calls, and eval hint.
 
 ## Business Flows
 
@@ -99,13 +102,29 @@ comments -> PRICE_MISMATCH -> get_live_products -> get_product_detail
 -> create_action_proposal -> create_approval_task
 ```
 
+Stream interrupted:
+
+```text
+stream_health_samples -> STREAM_INTERRUPTED -> stream_monitor_agent
+-> get_stream_incident_context -> search_policy_docs -> create_ops_alert
+-> create_speaker_note
+```
+
+Post-live report:
+
+```text
+ops_alerts / stream_incidents / speaker_notes / approvals
+-> report_agent -> post_live_report -> memory_updates
+```
+
 ## OpenClaw Agent Capability Mapping
 
 | OpenClaw capability | Meerkat implementation |
 |---|---|
-| Event-driven Agent Workflow | Owncast CHAT webhook and simulated comments trigger AgentTask |
+| Event-driven Agent Workflow | Owncast CHAT webhook, simulated comments, and stream health probes trigger AgentTask |
 | Tool Calling | comments, products, inventory, coupons, alerts, speaker notes, approvals are Agent tools |
-| Multi-Agent Dispatch | commander dispatches live_triage / product / coupon / policy / risk / script |
+| Multi-Agent Dispatch | commander dispatches stream_monitor / live_triage / product / coupon / policy / risk / script / report |
+| Stream Health | HLS/ffprobe-style samples create stream incidents and stream_monitor_agent tasks |
 | RAG / SOP Grounding | policy_agent searches `meerkat_agent/knowledge/*.md` |
 | Human-in-the-loop | price changes, coupon time changes, product hiding, and system messages are blocked or moved to approval |
 | Trace / Observability | `agent_action_logs` records subagent dispatch, tool calls, policy retrieval, risk decisions, and final actions |
@@ -129,7 +148,7 @@ Trace tr_...
 Query trace logs:
 
 ```bash
-curl "http://localhost:8018/api/v1/agent-action-logs?trace_id=tr_xxx"
+curl "http://localhost:8018/api/v1/traces/tr_xxx"
 ```
 
 ## Eval
@@ -139,9 +158,25 @@ cd meerkat_agent/evals
 python run_eval.py
 ```
 
-The eval checks Agent behavior quality: alert type, subagent dispatch, expected tools, tool execution, forbidden tool block, risk gate, approval trigger, SOP grounding, speaker note creation, and trace completeness. It writes `report.md`.
+The eval checks Agent behavior quality across 50 cases: alert type, stream health, false positives, subagent dispatch, expected tools, tool execution, forbidden tool block, risk gate, approval trigger, SOP grounding, speaker note creation, and trace completeness. It writes `report.md` and keeps failed cases visible.
 
-Latest local eval reports 1.00 for alert type, subagent dispatch, tool recall, tool precision, tool execution, forbidden-tool blocking, risk gate, approval trigger, SOP grounding, and trace completeness on the three MVP cases.
+Latest local eval:
+
+```text
+alert_type_accuracy = 0.94
+subagent_dispatch_coverage = 0.96
+tool_call_recall = 0.96
+tool_call_precision = 0.96
+tool_execution_success_rate = 1.00
+forbidden_tool_block_rate = 1.00
+risk_gate_accuracy = 0.96
+approval_trigger_accuracy = 1.00
+policy_grounding_accuracy = 0.94
+trace_completeness = 1.00
+p95_end_to_end_latency = 21 ms
+```
+
+Known failed cases are documented in `meerkat_agent/evals/report.md`; current gaps are natural inventory wording recall and mixed coupon + price split.
 
 ## Risk Levels
 
@@ -155,3 +190,7 @@ Latest local eval reports 1.00 for alert type, subagent dispatch, tool recall, t
 ## Resume
 
 Use [RESUME.md](./RESUME.md) as the Agent-first resume template. Do not fill metric placeholders until local eval has been run.
+
+## Roadmap
+
+The full product plan has been moved into [ROADMAP.md](./ROADMAP.md). It is the source of truth for v0.2-v1.0 scope and the final acceptance checklist.

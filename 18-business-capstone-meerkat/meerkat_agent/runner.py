@@ -11,6 +11,7 @@ from app.core.enums import AlertSeverity, AlertType
 from app.db.base import AgentRun, AgentTask
 from app.services.serialization import dumps, loads
 from app.services.trace_service import write_log
+from app.services.post_live_report_service import create_post_live_report
 from meerkat_agent.runtime.schemas import AgentTool
 from meerkat_agent.runtime.tool_registry import ToolRegistry
 from meerkat_agent.tools.meerkat_tools import MeerkatTools
@@ -34,7 +35,7 @@ class MeerkatAgentRunner:
         await write_log(self.db, trace_id=trace_id, session_id=task.session_id, agent_name="commander", action_type="AGENT_RUN_STARTED", output_data={"task_id": task.id, "run_id": run.id})
 
         try:
-            result = await self._run_workflow(task)
+            result = await self._run_workflow(task, run.id)
             run.status = "SUCCEEDED"
             run.finished_at = datetime.now(timezone.utc)
             run.final_output_json = dumps(result)
@@ -51,7 +52,7 @@ class MeerkatAgentRunner:
             await self.db.commit()
             raise
 
-    async def _run_workflow(self, task: AgentTask) -> dict[str, Any]:
+    async def _run_workflow(self, task: AgentTask, run_id: int) -> dict[str, Any]:
         alert_type = AlertType(task.alert_type_hint or AlertType.UNKNOWN.value)
         comment_ids = loads(task.comment_ids_json) or []
         input_payload = loads(task.input_payload_json) or {}
@@ -66,6 +67,7 @@ class MeerkatAgentRunner:
             ("get_product_detail", "READ_ONLY", tools.get_product_detail),
             ("get_product_inventory", "READ_ONLY", tools.get_product_inventory),
             ("get_coupon_detail", "READ_ONLY", tools.get_coupon_detail),
+            ("get_stream_incident_context", "READ_ONLY", tools.get_stream_incident_context),
             ("search_policy_docs", "READ_ONLY", tools.search_policy_docs),
             ("create_ops_alert", "LOW_RISK_WRITE", tools.create_ops_alert),
             ("create_speaker_note", "LOW_RISK_WRITE", tools.create_speaker_note),
@@ -73,6 +75,13 @@ class MeerkatAgentRunner:
             ("create_approval_task", "LOW_RISK_WRITE", tools.create_approval_task),
         ]:
             registry.register(AgentTool(name=name, risk_level=risk, description=name, handler=handler))
+
+        if task.task_type == "STREAM_HEALTH_ANALYSIS":
+            return await self._handle_stream_health(task, registry, input_payload.get("stream_incident_id"))
+        if task.task_type == "POST_LIVE_REPORT":
+            return await self._handle_post_live_report(task, run_id)
+        if task.task_type == "PRE_LIVE_CHECK":
+            return await self._handle_pre_live_check(task, registry)
 
         await self._dispatch(task, "live_triage", {"comment_ids": comment_ids})
         await registry.call("search_recent_comments", {"session_id": task.session_id, "q": alert_type.value, "limit": 50}, agent_name="live_triage")
@@ -88,6 +97,173 @@ class MeerkatAgentRunner:
             return await self._handle_price(task, registry, comment_ids, product_id or 3)
 
         return {"trace_id": task.trace_id, "alert_created": False, "reason": "unknown alert type"}
+
+    async def _handle_pre_live_check(self, task: AgentTask, registry: ToolRegistry) -> dict[str, Any]:
+        await self._dispatch(task, "product", {"purpose": "pre-live product and inventory check"})
+        products = await registry.call("get_live_products", {"session_id": task.session_id}, agent_name="product")
+        await self._dispatch(task, "coupon", {"purpose": "pre-live coupon validity check"})
+        coupon = await registry.call("get_coupon_detail", {"coupon_id": 1}, agent_name="coupon")
+        inventory = await registry.call("get_product_inventory", {"product_id": 2}, agent_name="product")
+        policies = await self._policy(task, registry, "开播前 价格 优惠券 库存 巡检")
+        await self._risk(task, "DESTRUCTIVE", True, ["change_coupon_time", "change_product_price"])
+        await self._action_plan(
+            task,
+            {
+                "checks": ["商品上架", "库存", "优惠券生效时间", "口播价与页面价"],
+                "issues": ["2 号链接库存为 0", "C50 优惠券尚未生效", "3 号链接口播价与页面价不一致"],
+            },
+        )
+        alert = await registry.call(
+            "create_ops_alert",
+            {
+                "session_id": task.session_id,
+                "alert_type": AlertType.PRICE_MISMATCH.value,
+                "severity": AlertSeverity.P1.value,
+                "title": "开播前巡检发现价格、券和库存风险",
+                "summary": "开播前巡检发现库存不足、优惠券未生效和口播价不一致，需人工确认后再开播。",
+                "evidence": {"products": products["items"], "coupon": coupon, "inventory": inventory, "policies": policies["items"]},
+                "product_id": 3,
+                "coupon_id": 1,
+            },
+        )
+        await write_log(self.db, trace_id=task.trace_id, session_id=task.session_id, agent_name="commander", action_type="ALERT_CREATED", output_data={"alert_id": alert["id"]})
+        proposal = await registry.call(
+            "create_action_proposal",
+            {
+                "session_id": task.session_id,
+                "alert_id": alert["id"],
+                "action_type": "PRE_LIVE_FIX_APPROVAL",
+                "risk_level": "DESTRUCTIVE",
+                "arguments": {"coupon_id": 1, "product_id": 3, "checks": ["coupon_time", "spoken_price"]},
+                "reason": "开播前调整优惠券时间或价格口径会影响交易承诺，必须人工审批。",
+                "status": "APPROVAL_CREATED",
+                "created_by_agent": "risk",
+            },
+            agent_name="risk",
+        )
+        note = await registry.call(
+            "create_speaker_note",
+            {"session_id": task.session_id, "alert_id": alert["id"], "body": "开播前请先确认 3 号链接价格口径和 C50 优惠券生效时间，2 号链接库存不足暂缓讲解。", "target": "operator"},
+            agent_name="script",
+        )
+        approval = await registry.call(
+            "create_approval_task",
+            {
+                "session_id": task.session_id,
+                "proposal_id": proposal["id"],
+                "title": "审批开播前价格和优惠券修正",
+                "reason": "开播前巡检发现高风险业务口径，需要人工确认。",
+                "payload": {"alert_id": alert["id"], "coupon_id": 1, "product_id": 3},
+                "risk_level": "DESTRUCTIVE",
+            },
+            agent_name="risk",
+        )
+        await write_log(self.db, trace_id=task.trace_id, session_id=task.session_id, agent_name="risk", parent_agent_name="commander", action_type="APPROVAL_CREATED", output_data={"approval_task_id": approval["id"]}, risk_level="DESTRUCTIVE")
+        return {
+            "trace_id": task.trace_id,
+            "session_id": task.session_id,
+            "workflow_name": "meerkat.liveops.pre_live_check",
+            "created_entities": {
+                "ops_alert_id": alert["id"],
+                "speaker_note_id": note["id"],
+                "approval_task_id": approval["id"],
+            },
+            "issues": ["inventory_shortage", "coupon_not_started", "price_mismatch"],
+            "alert_created": True,
+        }
+
+    async def _handle_post_live_report(self, task: AgentTask, run_id: int) -> dict[str, Any]:
+        await self._dispatch(task, "report", {"session_id": task.session_id})
+        report = await create_post_live_report(
+            self.db,
+            task.session_id,
+            trace_id=task.trace_id,
+            created_by_agent_run_id=run_id,
+            commit=False,
+        )
+        await self._subagent_result(
+            task,
+            "report",
+            {
+                "report_id": report["report_id"],
+                "metrics": report["metrics"],
+                "memory_updates": report["memory_updates"],
+            },
+        )
+        return {
+            "trace_id": task.trace_id,
+            "session_id": task.session_id,
+            "workflow_name": "meerkat.liveops.post_live_report",
+            "report_id": report["report_id"],
+            "created_entities": {"post_live_report_id": report["report_id"]},
+            "metrics": report["metrics"],
+            "memory_updates": report["memory_updates"],
+            "summary_markdown": report["summary_markdown"],
+            "alert_created": False,
+        }
+
+    async def _handle_stream_health(self, task: AgentTask, registry: ToolRegistry, stream_incident_id: int | None) -> dict[str, Any]:
+        if stream_incident_id is None:
+            return {"trace_id": task.trace_id, "alert_created": False, "reason": "missing stream_incident_id"}
+        alert_type = AlertType(task.alert_type_hint or AlertType.STREAM_INTERRUPTED.value)
+        await self._dispatch(task, "stream_monitor", {"stream_incident_id": stream_incident_id})
+        context = await registry.call("get_stream_incident_context", {"stream_incident_id": stream_incident_id}, agent_name="stream_monitor")
+        await self._subagent_result(
+            task,
+            "stream_monitor",
+            {
+                "incident_type": alert_type.value,
+                "confidence": 0.92,
+                "recommended_actions": ["检查 OBS 连接", "暂停商品讲解", "使用备用话术安抚观众"],
+            },
+        )
+        policies = await self._policy(task, registry, "推流 异常 断流 黑屏 无声 HLS")
+        await self._risk(task, "LOW_RISK_WRITE", False, [])
+        await self._action_plan(
+            task,
+            {
+                "recommended_actions": ["创建推流异常告警", "生成场控话术", "持续观察恢复状态"],
+                "incident_type": alert_type.value,
+            },
+        )
+        alert = await registry.call(
+            "create_ops_alert",
+            {
+                "session_id": task.session_id,
+                "alert_type": alert_type.value,
+                "severity": AlertSeverity.P1.value,
+                "title": f"直播推流异常：{alert_type.value}",
+                "summary": "stream_monitor_agent 已根据推流健康样本识别异常，并生成场控处理建议。",
+                "evidence": {"stream_incident_id": stream_incident_id, "context": context, "policies": policies["items"]},
+            },
+        )
+        await write_log(self.db, trace_id=task.trace_id, session_id=task.session_id, agent_name="commander", action_type="ALERT_CREATED", output_data={"alert_id": alert["id"]})
+        note = await registry.call(
+            "create_speaker_note",
+            {
+                "session_id": task.session_id,
+                "alert_id": alert["id"],
+                "body": "当前直播信号出现波动，请场控确认 OBS 和网络状态，主播先暂停关键商品承诺，等待恢复确认。",
+                "target": "field_control",
+            },
+            agent_name="script",
+        )
+        await write_log(self.db, trace_id=task.trace_id, session_id=task.session_id, agent_name="script", parent_agent_name="commander", action_type="SPEAKER_NOTE_CREATED", output_data={"speaker_note_id": note["id"]})
+        return {
+            "trace_id": task.trace_id,
+            "session_id": task.session_id,
+            "workflow_name": "meerkat.liveops.handle_stream_health",
+            "incident_type": alert_type.value,
+            "tool_calls": ["get_stream_incident_context", "search_policy_docs", "create_ops_alert", "create_speaker_note"],
+            "risk_level": "LOW_RISK_WRITE",
+            "created_entities": {
+                "stream_incident_id": stream_incident_id,
+                "ops_alert_id": alert["id"],
+                "speaker_note_id": note["id"],
+                "approval_task_id": None,
+            },
+            "alert_created": True,
+        }
 
     async def _handle_coupon(self, task: AgentTask, registry: ToolRegistry, comment_ids: list[int], coupon_id: int) -> dict[str, Any]:
         await self._dispatch(task, "coupon", {"coupon_id": coupon_id})

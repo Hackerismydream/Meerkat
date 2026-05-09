@@ -7,7 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import AlertSeverity, AlertStatus, AlertType
-from app.db.base import LiveComment, LiveSessionProduct, OpsAlert, utcnow
+from app.db.base import CommentCluster, LiveComment, LiveSessionProduct, OpsAlert, ProductAlias, utcnow
+from app.services.serialization import dumps
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,11 @@ def infer_product_alias(text: str) -> int | None:
 
 
 async def resolve_product_id(db: AsyncSession, session_id: int, comments: list[LiveComment], alert_type: AlertType) -> int | None:
+    aliases = list((await db.scalars(select(ProductAlias).where(ProductAlias.session_id == session_id))).all())
     for comment in comments:
+        for alias in aliases:
+            if alias.alias in comment.body:
+                return alias.product_id
         order = infer_product_alias(comment.body)
         if order:
             product_id = await db.scalar(
@@ -103,14 +108,28 @@ async def detect_after_comment(session_id: int, comment_id: int, db: AsyncSessio
         return []
 
     severity = AlertSeverity.P0 if alert_type == AlertType.PRICE_MISMATCH else AlertSeverity.P1
-    return [
-        DetectedAnomaly(
+    detected = DetectedAnomaly(
+        session_id=session_id,
+        alert_type=alert_type,
+        severity=severity,
+        comment_ids=[item.id for item in comments],
+        product_id=product_id,
+        coupon_id=coupon_id,
+        reason=f"{len(comments)} comments matched {alert_type.value} within 180s at {utcnow().isoformat()}",
+    )
+    db.add(
+        CommentCluster(
             session_id=session_id,
-            alert_type=alert_type,
-            severity=severity,
-            comment_ids=[item.id for item in comments],
-            product_id=product_id,
-            coupon_id=coupon_id,
-            reason=f"{len(comments)} comments matched {alert_type.value} within 180s at {utcnow().isoformat()}",
+            alert_type=alert_type.value,
+            status="CONFIRMED",
+            confidence=0.90,
+            evidence_comment_ids_json=dumps(detected.comment_ids),
+            target_product_id=product_id,
+            target_coupon_id=coupon_id,
+            summary=detected.reason,
         )
+    )
+    await db.flush()
+    return [
+        detected
     ]

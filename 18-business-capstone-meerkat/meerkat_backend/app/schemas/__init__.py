@@ -21,6 +21,29 @@ class SimulationResponse(BaseModel):
     agent_run_id: int | None = None
 
 
+class StreamHealthSampleInput(BaseModel):
+    is_live: bool = True
+    video_present: bool = True
+    audio_present: bool = True
+    bitrate_kbps: int | None = None
+    fps: float | None = None
+    width: int | None = None
+    height: int | None = None
+    last_segment_age_ms: int | None = None
+    probe_status: str = "OK"
+    probe_error: str | None = None
+
+
+class StreamHealthSimulationRequest(BaseModel):
+    session_id: int = 1
+    scenario: str = "stream_down"
+    samples: list[StreamHealthSampleInput] = Field(default_factory=list)
+
+
+class PostLiveReportRequest(BaseModel):
+    session_id: int = 1
+
+
 class CreateLiveSessionRequest(BaseModel):
     title: str
 

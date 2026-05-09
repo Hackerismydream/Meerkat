@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import AlertStatus, ApprovalStatus
-from app.db.base import ActionProposal, ApprovalTask, Coupon, LiveComment, LiveSessionProduct, OpsAlert, Product, SkuInventory
+from app.db.base import ActionProposal, ApprovalTask, Coupon, LiveComment, LiveSessionProduct, OpsAlert, Product, SkuInventory, StreamHealthSample, StreamIncident
 from app.services.serialization import dumps, model_to_dict
 
 
@@ -65,6 +65,22 @@ class MeerkatTools:
         if coupon is None:
             return {"error": "coupon_not_found", "coupon_id": coupon_id}
         return model_to_dict(coupon)
+
+    async def get_stream_incident_context(self, stream_incident_id: int) -> dict[str, Any]:
+        incident = await self.db.get(StreamIncident, stream_incident_id)
+        if incident is None:
+            return {"error": "stream_incident_not_found", "stream_incident_id": stream_incident_id}
+        samples = list(
+            (
+                await self.db.scalars(
+                    select(StreamHealthSample)
+                    .where(StreamHealthSample.session_id == incident.session_id)
+                    .order_by(StreamHealthSample.id.desc())
+                    .limit(5)
+                )
+            ).all()
+        )
+        return {"incident": model_to_dict(incident), "recent_samples": [model_to_dict(sample) for sample in samples]}
 
     async def search_policy_docs(self, query: str, top_k: int = 3) -> dict[str, Any]:
         terms = [term for term in query.replace("/", " ").split() if term]

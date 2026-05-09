@@ -7,9 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import LiveSessionStatus
 from app.db.base import LiveSession, OwncastEvent
-from app.schemas import SimulationComment
+from app.schemas import SimulationComment, StreamHealthSampleInput
 from app.services.serialization import dumps
 from app.services.simulation_service import insert_comments_and_run_agent
+from app.services.stream_health_service import simulate_stream_health
 
 
 def get_payload_type(payload: dict) -> str:
@@ -62,11 +63,23 @@ async def handle(payload: dict, *, session: AsyncSession) -> dict:
     elif event_type == "STREAM_STARTED":
         live_session.status = LiveSessionStatus.LIVE.value
         live_session.started_at = datetime.now(timezone.utc)
-        result = {"agent_runs_triggered": 0}
+        result = await simulate_stream_health(
+            session,
+            session_id=live_session.id,
+            scenario="stream_started",
+            samples=[StreamHealthSampleInput(is_live=True, probe_status="OK")],
+        )
     elif event_type == "STREAM_STOPPED":
-        live_session.status = LiveSessionStatus.ENDED.value
-        live_session.ended_at = datetime.now(timezone.utc)
-        result = {"agent_runs_triggered": 0}
+        result = await simulate_stream_health(
+            session,
+            session_id=live_session.id,
+            scenario="stream_down",
+            samples=[
+                StreamHealthSampleInput(is_live=False, probe_status="FAILED", probe_error="Owncast STREAM_STOPPED"),
+                StreamHealthSampleInput(is_live=False, probe_status="FAILED", probe_error="Owncast STREAM_STOPPED"),
+                StreamHealthSampleInput(is_live=False, probe_status="FAILED", probe_error="Owncast STREAM_STOPPED"),
+            ],
+        )
     else:
         result = {"agent_runs_triggered": 0}
 
